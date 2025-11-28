@@ -1,0 +1,115 @@
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# --- CONFIGURARE MODEL ---
+# X-ALMA-13B-Group2: Varianta specializată pe Limbi Romanice (inclusiv ROMÂNĂ)
+# Aceasta este versiunea "Merged", gata de utilizare directă.
+MODEL_ID = "haoranxu/X-ALMA-13B-Group2"
+
+# Setări Server
+HOST = "0.0.0.0"
+PORT = 8000
+
+app = FastAPI(title="X-ALMA Translation API (Romanian Specialist)", version="4.0")
+
+model = None
+tokenizer = None
+
+class TranslationRequest(BaseModel):
+    text: str
+    source_lang: str = "English"
+    target_lang: str = "Romanian"
+    # X-ALMA nu are nevoie de temperatură mare, este foarte determinist
+    temperature: float = 0.1 
+
+@app.on_event("startup")
+async def load_model():
+    global model, tokenizer
+    print(f"🚀 Se inițializează Specialistul: {MODEL_ID}...")
+    print("ℹ️ Acest model face parte din familia X-ALMA, optimizată specific pentru limbi romanice.")
+    print("📉 Optimizare: Se folosește 8-bit Quantization (Calitate Superioară).")
+
+    try:
+        # 1. Configurare Cuantizare 8-bit
+        # Pe RTX 5090 (32GB), un model de 13B în 8-bit ocupă doar ~14GB.
+        # Alegem 8-bit în loc de 4-bit pentru a păstra fiecare nuanță a traducerii.
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+
+        # 2. Încărcare Tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+        
+        # 3. Încărcare Model
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        print(f"✅ X-ALMA Group2 Încărcat! Ești gata pentru traduceri de precizie în Română.")
+        
+    except Exception as e:
+        print(f"❌ Eroare la încărcare: {e}")
+        raise e
+
+@app.post("/translate")
+async def translate_text(request: TranslationRequest):
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
+
+    # X-ALMA folosește un prompt simplu de chat pentru a activa traducerea
+    # Formatul recomandat de autori:
+    prompt_content = f"Translate this from {request.source_lang} to {request.target_lang}:\n{request.text}"
+    
+    messages = [
+        {"role": "user", "content": prompt_content}
+    ]
+
+    # Aplicăm template-ul de chat specific X-ALMA
+    text_input = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
+    
+    inputs = tokenizer([text_input], return_tensors="pt").to("cuda")
+
+    try:
+        # Inferență X-ALMA
+        # Folosim Beam Search modest (num_beams=3) pentru a garanta calitatea gramaticală
+        # fără a încetini excesiv procesul.
+        generated_ids = model.generate(
+            inputs.input_ids,
+            max_new_tokens=4096, # Suportă texte lungi
+            num_beams=3,         # Balans ideal între viteză și corectitudine gramaticală
+            do_sample=False,     # Determinism pur pentru traduceri tehnice/oficiale
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+        # Extragem doar răspunsul
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        response_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        return {
+            "source": request.source_lang,
+            "target": request.target_lang,
+            "model": "X-ALMA-13B-Group2",
+            "translation": response_text.strip()
+        }
+
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise HTTPException(status_code=500, detail="VRAM Insuficient. Încearcă un text mai scurt.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run("translation_server:app", host=HOST, port=PORT, reload=False)
