@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Dict
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import ffmpeg
 import pysubs2
@@ -40,8 +42,20 @@ class SubtitleGenerator:
         self._summary_service = SummaryService()
         
         # Configurare Server Local Traducere
+        # NOTĂ: Dacă rulezi în Docker, folosește 'http://host.docker.internal:8001/translate'
         self._local_server_url = os.getenv("LOCAL_TRANSLATION_URL", "http://localhost:8001/translate")
-        self._session = requests.Session() # Conexiune persistentă pentru viteză
+        
+        # Configurare Sesiune HTTP cu Retry (pentru robustețe)
+        self._session = requests.Session()
+        retries = Retry(
+            total=3,                # Încearcă de 3 ori
+            backoff_factor=0.2,     # Așteaptă puțin între încercări
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
         # Configurare Legacy (Ollama / Fallback)
         self._ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -57,6 +71,9 @@ class SubtitleGenerator:
             "ru": "Russian", "zh": "Chinese", "ja": "Japanese",
             "pt": "Portuguese"
         }
+        
+        # Flag intern pentru a loga succesul conexiunii o singură dată
+        self._server_connected_once = False
 
     # ------------ Internals ------------
     def _load_model(self):
@@ -67,6 +84,7 @@ class SubtitleGenerator:
 
     def _map_lang_code(self, code: str) -> str:
         """Convertește 'en' -> 'English' pentru prompt-ul modelului LLM."""
+        if not code: return "English"
         return self._lang_map.get(code.lower(), code.title())
 
     def _transcribe(self, filepath: str):
@@ -92,18 +110,22 @@ class SubtitleGenerator:
         }
 
         try:
-            resp = self._session.post(self._local_server_url, json=payload, timeout=30)
+            # Timeout crescut la 60s pentru modele mari care pot avea latență la primul request
+            resp = self._session.post(self._local_server_url, json=payload, timeout=60)
+            
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("translation", "").strip()
             else:
                 logging.warning(f"[SUBTITLE] Server Error {resp.status_code}: {resp.text}")
                 return ""
+                
         except requests.exceptions.ConnectionError:
-            logging.error(f"[SUBTITLE] Nu mă pot conecta la serverul local: {self._local_server_url}")
+            # Aceasta este eroarea critică dacă serverul nu merge
+            logging.error(f"[SUBTITLE] 🛑 EROARE CONEXIUNE: Nu pot accesa {self._local_server_url}")
             return "CONNECTION_ERROR"
         except Exception as e:
-            logging.warning(f"[SUBTITLE] Eroare traducere server: {e}")
+            logging.warning(f"[SUBTITLE] Eroare generală traducere server: {e}")
             return ""
 
     def _translate_ollama(self, text: str, target_lang: str) -> str:
@@ -151,10 +173,11 @@ class SubtitleGenerator:
         
         # Inițializăm Cloud Translator doar dacă e cerut explicit sau ca fallback
         cloud_translator = None
-        if mode == "cloud":
-            cloud_translator = GoogleTranslator(source="auto", target=target_lang)
-
+        
         server_available = True
+        
+        # Resetăm flag-ul de conexiune pentru acest job
+        self._server_connected_once = False
 
         for i, seg in enumerate(segments):
             orig = (seg.get("text") or "").strip()
@@ -172,27 +195,33 @@ class SubtitleGenerator:
                 translation = self._translate_via_server(orig, source_lang_detected, target_lang)
                 
                 if translation == "CONNECTION_ERROR":
-                    logging.warning("[SUBTITLE] Serverul local nu răspunde. Trecem pe fallback (Cloud/Ollama).")
-                    server_available = False # Dezactivăm serverul pentru restul segmentelor
-                    translation = "" # Forțăm intrarea în fallback
-                elif not translation:
-                     # Serverul a răspuns dar gol sau eroare internă
-                     pass
+                    logging.warning("[SUBTITLE] ⚠️ Serverul local nu a răspuns. Comutăm automat pe Google Translate.")
+                    server_available = False # Circuit breaker: oprim încercările spre server
+                    translation = "" 
+                elif translation:
+                    # Logăm succesul o singură dată per video, ca să știm că merge
+                    if not self._server_connected_once:
+                        logging.info(f"[SUBTITLE] ✅ Conexiune stabilă cu Serverul Local ({self._local_server_url}). Traducere neurală activă.")
+                        self._server_connected_once = True
+                
+                # Dacă translation e gol dar nu e connection error, serverul a returnat gol -> încercăm fallback
 
             # 2. Fallback: Google Translate (dacă serverul a picat sau mode="cloud")
             if not translation:
                 try:
                     if not cloud_translator:
+                        # Inițializare lazy
                         cloud_translator = GoogleTranslator(source="auto", target=target_lang)
                     translation = cloud_translator.translate(orig)
                 except Exception as e:
+                    # Log doar la debug ca să nu umplem consola
                     logging.debug(f"Google translate fail: {e}")
 
-            # 3. Fallback Ultim: Ollama vechi (dacă există)
+            # 3. Fallback Ultim: Ollama vechi (dacă există și Google a eșuat)
             if not translation:
                 translation = self._translate_ollama(orig, target_lang)
 
-            # 4. Fail-safe
+            # 4. Fail-safe: Originalul
             translated.append(translation if translation else orig)
 
             # Log progress discret (la fiecare 10 segmente)
