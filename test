@@ -5,6 +5,8 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, validator
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from enum import Enum
+from typing import Optional
 
 # --- CONFIGURARE LOGGING ---
 logging.basicConfig(
@@ -14,162 +16,514 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURARE MODEL ---
-# QwQ-32B-Preview: Model de reasoning foarte puternic
-MODEL_ID = "Qwen/QwQ-32B-Preview"
+MODEL_ID = "haoranxu/X-ALMA-13B-Group2"
 HOST = "0.0.0.0"
-PORT = 8002  # Port diferit față de ALMA (8001)
+PORT = 8001
 
 app = FastAPI(
-    title="QwQ-32B Translation API (Reasoning Specialist)",
-    version="1.0",
-    description="API de traducere strictă folosind QwQ-32B cu suprimarea reasoning-ului"
+    title="X-ALMA Translation API (Multi-Strategy)",
+    version="6.0",
+    description="API de traducere inteligent cu detecție automată de strategie"
 )
 
 model = None
 tokenizer = None
 
+# --- MAPARE GRUPURI LIMBI X-ALMA ---
+LANGUAGE_GROUPS = {
+    # Group 1: Germanic + Slavic core
+    "German": 1, "Czech": 1, "Icelandic": 1, "Russian": 1,
+    
+    # Group 2: Romance languages (MODELUL NOSTRU)
+    "Romanian": 2, "Catalan": 2, "Galician": 2, 
+    "Italian": 2, "Portuguese": 2, "Spanish": 2,
+    
+    # Group 3: More Slavic + Baltic
+    "Ukrainian": 3, "Belarusian": 3, "Bulgarian": 3,
+    "Macedonian": 3, "Lithuanian": 3, "Latvian": 3,
+    
+    # Group 4: More Germanic + Nordic
+    "Dutch": 4, "Danish": 4, "Swedish": 4, "Norwegian": 4,
+    
+    # Group 5: Indo-Aryan + Persian
+    "Hindi": 5, "Bengali": 5, "Marathi": 5, "Nepali": 5, "Farsi": 5,
+    
+    # Group 6: East Asian + Finno-Ugric
+    "Chinese": 6, "Japanese": 6, "Korean": 6,
+    "Finnish": 6, "Estonian": 6, "Georgian": 6,
+    
+    # English: Universal pivot
+    "English": 0  # Group 0 = pivot language
+}
+
+class TranslationStrategy(str, Enum):
+    """Strategii de traducere disponibile"""
+    DIRECT = "direct"  # Traducere directă (pentru limbi din același grup sau cu EN)
+    PIVOT = "pivot"    # Traducere prin pivot EN (pentru grupuri diferite)
+    AUTO = "auto"      # Detecție automată
+
+# --- PATTERN-URI PENTRU CURĂȚARE ---
+CLEANUP_PATTERNS = [
+    # Ghilimele și apostrof
+    (r'^["\'](.+)["\']$', r'\1'),
+    (r'^"(.+)"$', r'\1'),
+    (r"^'(.+)'$", r'\1'),
+    
+    # Prefixe comune în răspunsuri (case insensitive)
+    (r'^(?:Traducere|Translation|Răspuns|Raspuns|Answer|Result|Output)\s*:\s*', '', re.IGNORECASE),
+    (r'^(?:În|In)\s+(?:limba\s+)?(?:română|romana|română|english)\s*:\s*', '', re.IGNORECASE),
+    (r'^(?:Here is the translation|Iată traducerea)\s*:\s*', '', re.IGNORECASE),
+    
+    # Explicații între paranteze la final
+    (r'\s*\([^)]*explanation[^)]*\)\s*$', '', re.IGNORECASE),
+    (r'\s*\([^)]*note[^)]*\)\s*$', '', re.IGNORECASE),
+    (r'\s*\([^)]*literal[^)]*\)\s*$', '', re.IGNORECASE),
+    
+    # Explicații după liniuță
+    (r'\s*[-–—]\s*(?:this means|meaning|i\.e\.|note|explanation).*$', '', re.IGNORECASE),
+    
+    # Notițe la final
+    (r'\n\s*(?:Note|Notă|N\.B\.|P\.S\.|FYI)\s*:.*$', '', re.IGNORECASE | re.MULTILINE),
+    (r'\n\s*\*\s*.*(?:literal|meaning|explanation).*$', '', re.IGNORECASE | re.MULTILINE),
+    
+    # Markdown și formatare
+    (r'^\*\*(.+)\*\*$', r'\1'),
+    (r'^`(.+)`$', r'\1'),
+    
+    # Spații multiple și newline-uri
+    (r'^\s+|\s+$', ''),
+    (r'\n{3,}', '\n\n'),
+]
+
+def clean_translation_output(text: str) -> str:
+    """Curăță outputul de la model"""
+    if not text:
+        return text
+    
+    cleaned = text.strip()
+    
+    for pattern_data in CLEANUP_PATTERNS:
+        if len(pattern_data) == 2:
+            pattern, replacement = pattern_data
+            flags = 0
+        else:
+            pattern, replacement, flags = pattern_data
+        
+        cleaned = re.sub(pattern, replacement, cleaned, flags=flags)
+        cleaned = cleaned.strip()
+    
+    # Elimină ghilimele la început/final
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.startswith("'") and cleaned.endswith("'"):
+        cleaned = cleaned[1:-1].strip()
+    
+    # Curăță spații multiple
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\s*\n\s*', '\n', cleaned)
+    
+    # Elimină paranteze lungi la final
+    cleaned = re.sub(r'\s*\([^)]{10,}\)\s*$', '', cleaned)
+    
+    # Taie tot după două newline-uri consecutive
+    if '\n\n' in cleaned:
+        cleaned = cleaned.split('\n\n')[0].strip()
+    
+    return cleaned
+
+def get_language_group(language: str) -> int:
+    """Returnează grupul limbii sau -1 dacă nu e suportată"""
+    return LANGUAGE_GROUPS.get(language, -1)
+
+def determine_translation_strategy(source_lang: str, target_lang: str) -> tuple[TranslationStrategy, str]:
+    """
+    Determină strategia optimă de traducere bazată pe grupurile limbilor
+    
+    Returns:
+        (strategy, reason) - strategia și explicația
+    """
+    source_group = get_language_group(source_lang)
+    target_group = get_language_group(target_lang)
+    
+    # Limbi nesuportate
+    if source_group == -1 or target_group == -1:
+        unsupported = []
+        if source_group == -1:
+            unsupported.append(source_lang)
+        if target_group == -1:
+            unsupported.append(target_lang)
+        return TranslationStrategy.DIRECT, f"⚠️ Limbă nesuportată: {', '.join(unsupported)}"
+    
+    # Engleza e implicată → traducere directă
+    if source_group == 0 or target_group == 0:
+        return TranslationStrategy.DIRECT, "✅ Traducere directă (include Engleză)"
+    
+    # Același grup → traducere directă
+    if source_group == target_group:
+        return TranslationStrategy.DIRECT, f"✅ Traducere directă (același grup {source_group})"
+    
+    # Grupuri diferite → PIVOT prin engleză
+    return TranslationStrategy.PIVOT, f"🔄 Pivot prin Engleză (grup {source_group} → grup {target_group})"
+
+def _core_translate(text: str, source_lang: str, target_lang: str, max_length: int, num_beams: int) -> str:
+    """Funcție internă de traducere (o singură direcție)"""
+    
+    # Prompt strict
+    prompt = f"""Translate this from {source_lang} to {target_lang}. Output ONLY the translation, no explanations, no notes, no extra text:
+
+{text}
+
+Translation:"""
+    
+    messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        text_input = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    except Exception:
+        text_input = prompt
+    
+    inputs = tokenizer(
+        [text_input],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=4096
+    ).to("cuda")
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            max_new_tokens=max_length,
+            num_beams=num_beams,
+            do_sample=False,
+            temperature=None,
+            repetition_penalty=1.15,
+            length_penalty=1.0,
+            early_stopping=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            no_repeat_ngram_size=3
+        )
+
+    # Elimină promptul
+    generated_ids = [
+        output_ids[len(input_ids):] 
+        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    
+    response_text = tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True
+    )[0]
+    
+    return clean_translation_output(response_text)
+
 class TranslationRequest(BaseModel):
     text: str
     source_lang: str = "English"
     target_lang: str = "Romanian"
-    max_length: int = 4096
+    max_length: int = 2048
+    use_beam_search: bool = True
+    num_beams: int = 3
+    strategy: TranslationStrategy = TranslationStrategy.AUTO
     
     @validator('text')
     def validate_text(cls, v):
         if not v or len(v.strip()) == 0:
             raise ValueError("Textul nu poate fi gol")
+        if len(v) > 15000:
+            raise ValueError("Text prea lung (max 15000 caractere)")
         return v.strip()
-
-def clean_qwq_output(text: str) -> str:
-    """
-    Curăță outputul specific modelelor de reasoning (QwQ/DeepSeek).
-    Elimină tag-urile <think> și explicațiile.
-    """
-    if not text:
-        return ""
-
-    # 1. Elimină blocuri de gândire <think>...</think> (inclusiv pe mai multe linii)
-    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     
-    # 2. Elimină doar tag-urile rămase (dacă modelul a uitat să le închidă)
-    cleaned = re.sub(r'<think>', '', cleaned)
-    cleaned = re.sub(r'</think>', '', cleaned)
-
-    # 3. Elimină prefixe comune de chat
-    patterns = [
-        r'^(?:Here is the translation|Translation|Traducere|Răspuns):',
-        r'^Sure, here is.*?:',
-        r'^Certainly.*?:',
-    ]
-    for p in patterns:
-        cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE)
-
-    # 4. Elimină ghilimele exterioare
-    cleaned = cleaned.strip()
-    if cleaned.startswith('"') and cleaned.endswith('"'):
-        cleaned = cleaned[1:-1]
+    @validator('max_length')
+    def validate_max_length(cls, v):
+        if v < 128 or v > 4096:
+            raise ValueError("max_length trebuie să fie între 128 și 4096")
+        return v
     
-    return cleaned.strip()
+    @validator('num_beams')
+    def validate_num_beams(cls, v):
+        if v < 1 or v > 5:
+            raise ValueError("num_beams trebuie să fie între 1 și 5")
+        return v
+
+class BatchTranslationRequest(BaseModel):
+    texts: list[str]
+    source_lang: str = "English"
+    target_lang: str = "Romanian"
+    max_length: int = 2048
+    strategy: TranslationStrategy = TranslationStrategy.AUTO
+    
+    @validator('texts')
+    def validate_texts(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("Lista de texte nu poate fi goală")
+        if len(v) > 50:
+            raise ValueError("Maximum 50 texte per batch")
+        for text in v:
+            if len(text) > 15000:
+                raise ValueError("Unul dintre texte depășește 15000 caractere")
+        return v
 
 @app.on_event("startup")
 async def load_model():
     global model, tokenizer
-    logger.info(f"🚀 Se inițializează QwQ-32B: {MODEL_ID}...")
-    logger.info("ℹ️ Optimizare: 4-bit NF4 (Mandatoriu pentru 32B pe 32GB VRAM)")
+    logger.info(f"🚀 Se inițializează: {MODEL_ID}...")
+    logger.info("ℹ️ Arhitectura: Decoder-Only (LLaMA Based)")
     
     try:
-        # Configurare Cuantizare 4-bit (NF4)
-        # 32B params * 0.5 bytes = ~16GB VRAM modelul + context overhead
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_ID,
+            trust_remote_code=True,
+            use_fast=True
+        )
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
         )
         
-        logger.info(f"✅ QwQ-32B Încărcat pe Portul {PORT}!")
+        model.eval()
+        
+        logger.info(f"✅ Model Încărcat! VRAM optimizată cu 8-bit quantization.")
+        logger.info(f"📊 Device map: {model.hf_device_map}")
         
     except Exception as e:
-        logger.error(f"❌ Eroare la încărcare QwQ: {e}", exc_info=True)
+        logger.error(f"❌ Eroare la încărcare: {e}", exc_info=True)
         raise e
+
+@app.get("/health")
+async def health_check():
+    """Verifică starea serverului"""
+    cuda_available = torch.cuda.is_available()
+    vram_allocated = torch.cuda.memory_allocated(0) / 1024**3 if cuda_available else 0
+    vram_reserved = torch.cuda.memory_reserved(0) / 1024**3 if cuda_available else 0
+    
+    return {
+        "status": "healthy" if model is not None else "loading",
+        "model": MODEL_ID,
+        "model_loaded": model is not None,
+        "device": "cuda" if cuda_available else "cpu",
+        "vram_allocated_gb": round(vram_allocated, 2),
+        "vram_reserved_gb": round(vram_reserved, 2),
+        "supported_languages": list(LANGUAGE_GROUPS.keys()),
+        "total_languages": len(LANGUAGE_GROUPS)
+    }
+
+@app.get("/languages")
+async def list_languages():
+    """Listează limbile suportate și grupurile lor"""
+    groups = {}
+    for lang, group in LANGUAGE_GROUPS.items():
+        if group not in groups:
+            groups[group] = []
+        groups[group].append(lang)
+    
+    return {
+        "languages": LANGUAGE_GROUPS,
+        "groups": groups,
+        "note": "Group 0 (English) este pivot universal. Traducerile între grupuri diferite folosesc pivot automat."
+    }
 
 @app.post("/translate")
 async def translate_text(request: TranslationRequest):
+    """Traduce text cu detecție automată de strategie"""
     if not model or not tokenizer:
         raise HTTPException(status_code=503, detail="Modelul se încarcă...")
 
-    # --- PROMPT STRICT PENTRU QwQ ---
-    # QwQ tinde să gândească mult. Îl forțăm să fie direct.
-    system_instruction = (
-        "You are a strict translation engine. Your ONLY task is to translate the input text. "
-        "Rules:\n"
-        "1. Output ONLY the translation.\n"
-        "2. Do NOT output reasoning, thinking process, or <think> tags.\n"
-        "3. Do NOT provide explanations, notes, or introductions.\n"
-        "4. Maintain the tone and style of the original text."
-    )
+    # Determină strategia
+    if request.strategy == TranslationStrategy.AUTO:
+        strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
+    else:
+        strategy = request.strategy
+        reason = f"Strategie forțată: {strategy.value}"
     
-    user_content = f"Translate from {request.source_lang} to {request.target_lang}:\n{request.text}"
-
-    messages = [
-        {"role": "system", "content": system_instruction},
-        {"role": "user", "content": user_content}
-    ]
-    
-    # QwQ folosește template-ul standard ChatML sau Qwen
-    text_input = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
-    )
-    
-    inputs = tokenizer([text_input], return_tensors="pt").to("cuda")
+    logger.info(f"📝 Traducere: {request.source_lang} -> {request.target_lang}")
+    logger.info(f"🎯 Strategie: {strategy.value} - {reason}")
+    logger.info(f"📏 Lungime: {len(request.text)} caractere")
 
     try:
-        with torch.no_grad():
-            generated_ids = model.generate(
-                inputs.input_ids,
-                max_new_tokens=request.max_length,
-                do_sample=False,       # Greedy decoding pentru strictețe maximă
-                temperature=None,      # Ignorat la greedy, dar setat explicit
-                top_p=None,            # Ignorat la greedy
-                repetition_penalty=1.1 # Previne buclele în traduceri lungi
+        if strategy == TranslationStrategy.DIRECT:
+            # Traducere directă
+            translation = _core_translate(
+                request.text,
+                request.source_lang,
+                request.target_lang,
+                request.max_length,
+                request.num_beams if request.use_beam_search else 1
             )
-
-        # Extrage doar răspunsul nou
-        generated_ids = [
-            output_ids[len(input_ids):] 
-            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
+            steps = 1
+            
+        else:  # PIVOT
+            # Pas 1: Source -> English
+            logger.info(f"🔄 Pas 1/2: {request.source_lang} -> English")
+            english_text = _core_translate(
+                request.text,
+                request.source_lang,
+                "English",
+                request.max_length,
+                request.num_beams if request.use_beam_search else 1
+            )
+            
+            # Pas 2: English -> Target
+            logger.info(f"🔄 Pas 2/2: English -> {request.target_lang}")
+            translation = _core_translate(
+                english_text,
+                "English",
+                request.target_lang,
+                request.max_length,
+                request.num_beams if request.use_beam_search else 1
+            )
+            steps = 2
         
-        raw_output = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
-        # Curățare agresivă
-        cleaned_translation = clean_qwq_output(raw_output)
+        logger.info(f"✅ Traducere completă: {len(translation)} caractere")
         
         return {
             "source": request.source_lang,
             "target": request.target_lang,
-            "model": "Qwen/QwQ-32B-Preview",
-            "translation": cleaned_translation
+            "model": "X-ALMA-13B-Group2",
+            "strategy": strategy.value,
+            "strategy_reason": reason,
+            "translation": translation,
+            "stats": {
+                "chars_in": len(request.text),
+                "chars_out": len(translation),
+                "translation_steps": steps,
+                "intermediate_translation": english_text if strategy == TranslationStrategy.PIVOT else None
+            }
         }
 
     except torch.cuda.OutOfMemoryError:
-        logger.error("❌ VRAM Insuficient pe QwQ!")
+        logger.error("❌ VRAM insuficient!")
         torch.cuda.empty_cache()
-        raise HTTPException(status_code=507, detail="VRAM Insuficient. Textul e prea lung pentru contextul rămas.")
+        raise HTTPException(status_code=507, detail="VRAM insuficient.")
     except Exception as e:
-        logger.error(f"Eroare inferență: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Eroare: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+@app.post("/translate/batch")
+async def translate_batch(request: BatchTranslationRequest):
+    """Traduce multiple texte cu strategie automată"""
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
+
+    # Determină strategia
+    if request.strategy == TranslationStrategy.AUTO:
+        strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
+    else:
+        strategy = request.strategy
+        reason = f"Strategie forțată: {strategy.value}"
+    
+    logger.info(f"📦 Batch: {len(request.texts)} texte")
+    logger.info(f"🎯 Strategie: {strategy.value} - {reason}")
+
+    try:
+        translations = []
+        
+        for i, text in enumerate(request.texts):
+            logger.info(f"📝 Traducere {i+1}/{len(request.texts)}")
+            
+            if strategy == TranslationStrategy.DIRECT:
+                translation = _core_translate(
+                    text,
+                    request.source_lang,
+                    request.target_lang,
+                    request.max_length,
+                    2  # Beam search redus pentru batch
+                )
+            else:  # PIVOT
+                english_text = _core_translate(
+                    text,
+                    request.source_lang,
+                    "English",
+                    request.max_length,
+                    2
+                )
+                translation = _core_translate(
+                    english_text,
+                    "English",
+                    request.target_lang,
+                    request.max_length,
+                    2
+                )
+            
+            translations.append(translation)
+        
+        logger.info(f"✅ Batch completat: {len(translations)} traduceri")
+        
+        return {
+            "source": request.source_lang,
+            "target": request.target_lang,
+            "model": "X-ALMA-13B-Group2",
+            "strategy": strategy.value,
+            "strategy_reason": reason,
+            "translations": translations,
+            "count": len(translations)
+        }
+
+    except torch.cuda.OutOfMemoryError:
+        logger.error("❌ VRAM insuficient!")
+        torch.cuda.empty_cache()
+        raise HTTPException(status_code=507, detail="VRAM insuficient.")
+    except Exception as e:
+        logger.error(f"❌ Eroare: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+@app.post("/translate/debug")
+async def translate_debug(request: TranslationRequest):
+    """Debug endpoint cu informații detaliate"""
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
+
+    strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
+    
+    source_group = get_language_group(request.source_lang)
+    target_group = get_language_group(request.target_lang)
+    
+    return {
+        "source_language": request.source_lang,
+        "target_language": request.target_lang,
+        "source_group": source_group,
+        "target_group": target_group,
+        "recommended_strategy": strategy.value,
+        "strategy_reason": reason,
+        "will_use_pivot": strategy == TranslationStrategy.PIVOT,
+        "supported_languages": list(LANGUAGE_GROUPS.keys()),
+        "input_text": request.text,
+        "input_length": len(request.text)
+    }
 
 if __name__ == "__main__":
-    uvicorn.run("qwq_server:app", host=HOST, port=PORT, reload=False)
+    uvicorn.run(
+        "alma_server:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        workers=1,
+        log_level="info"
+    )
