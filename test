@@ -1,403 +1,418 @@
-from __future__ import annotations
-
+import re
+import torch
+import uvicorn
 import logging
-import os
-import threading
-import time
-from pathlib import Path
-from typing import List, Tuple, Dict
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, validator
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-import ffmpeg
-import pysubs2
-import whisper
-from deep_translator import GoogleTranslator
+# --- CONFIGURARE LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-from services.progress_bar import send_task_progress
-from services.category_v.summary_service import SummaryService
+# --- CONFIGURARE MODEL ---
+MODEL_ID = "haoranxu/X-ALMA-13B-Group2"
+HOST = "0.0.0.0"
+PORT = 8001
 
+app = FastAPI(
+    title="X-ALMA Translation API (Romanian Specialist)",
+    version="5.0",
+    description="API de traducere optimizat pentru română folosind X-ALMA-13B-Group2"
+)
 
-class SubtitleGenerator:
+model = None
+tokenizer = None
+
+# --- PATTERN-URI PENTRU CURĂȚARE ---
+CLEANUP_PATTERNS = [
+    # Ghilimele și apostrof
+    (r'^["\'](.+)["\']$', r'\1'),
+    (r'^"(.+)"$', r'\1'),
+    (r"^'(.+)'$", r'\1'),
+    
+    # Prefixe comune în răspunsuri (case insensitive)
+    (r'^(?:Traducere|Translation|Răspuns|Raspuns|Answer|Result|Output)\s*:\s*', '', re.IGNORECASE),
+    (r'^(?:În|In)\s+(?:limba\s+)?(?:română|romana|romană|english)\s*:\s*', '', re.IGNORECASE),
+    (r'^(?:Here is the translation|Iată traducerea)\s*:\s*', '', re.IGNORECASE),
+    
+    # Markdown și formatare
+    (r'^\*\*(.+)\*\*$', r'\1'),
+    (r'^`(.+)`$', r'\1'),
+    
+    # Spații multiple și newline-uri la început/final
+    (r'^\s+|\s+$', ''),
+    (r'\n{3,}', '\n\n'),
+]
+
+def clean_translation_output(text: str) -> str:
     """
-    Flux complet de subtitrare:
-    1) Transcriere video cu Whisper (auto detectează limba).
-    2) Traducere via Local High-End Server (RTX 5090) cu fallback la Cloud.
-    3) Scriere SRT în 'processed/'.
-    4) Dacă attach_mode == 'hard', arde subtitrarea în video cu ffmpeg.
+    Curăță outputul de la model eliminând:
+    - Ghilimele redundante
+    - Prefixe de tip "Răspuns:", "In limba romana:", etc.
+    - Formatare markdown inutilă
+    - Spații excesive
     """
+    if not text:
+        return text
+    
+    cleaned = text.strip()
+    
+    # Aplică toate pattern-urile de curățare
+    for pattern_data in CLEANUP_PATTERNS:
+        if len(pattern_data) == 2:
+            pattern, replacement = pattern_data
+            flags = 0
+        else:
+            pattern, replacement, flags = pattern_data
+        
+        cleaned = re.sub(pattern, replacement, cleaned, flags=flags)
+        cleaned = cleaned.strip()
+    
+    # Elimină ghilimele doar la început și final (nu din mijlocul textului)
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.startswith("'") and cleaned.endswith("'"):
+        cleaned = cleaned[1:-1].strip()
+    
+    # Curăță spații multiple
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    # Restaurează newline-uri normale (păstrează paragrafele)
+    cleaned = re.sub(r'\s*\n\s*', '\n', cleaned)
+    
+    logger.debug(f"Curățare: '{text[:50]}...' -> '{cleaned[:50]}...'")
+    
+    return cleaned
 
-    def __init__(
-        self,
-        processed_dir: str = "processed",
-        whisper_model: str = "small",
-    ):
-        self.processed_dir = Path(processed_dir)
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
-        self.whisper_model_name = whisper_model
-        self._model = None
-        self._global_start = None
-        self._total_expected = None
-        self._summary_service = SummaryService()
-        
-        # Configurare Server Local Traducere
-        # NOTĂ: Dacă rulezi în Docker, folosește 'http://host.docker.internal:8001/translate'
-        self._local_server_url = os.getenv("LOCAL_TRANSLATION_URL", "http://localhost:8001/translate")
-        
-        # Configurare Sesiune HTTP cu Retry (pentru robustețe)
-        self._session = requests.Session()
-        retries = Retry(
-            total=3,                # Încearcă de 3 ori
-            backoff_factor=0.2,     # Așteaptă puțin între încercări
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["POST"]
+class TranslationRequest(BaseModel):
+    text: str
+    source_lang: str = "English"
+    target_lang: str = "Romanian"
+    max_length: int = 2048
+    use_beam_search: bool = True
+    num_beams: int = 3
+    
+    @validator('text')
+    def validate_text(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Textul nu poate fi gol")
+        if len(v) > 15000:
+            raise ValueError("Text prea lung (max 15000 caractere pentru context mare)")
+        return v.strip()
+    
+    @validator('max_length')
+    def validate_max_length(cls, v):
+        if v < 128 or v > 4096:
+            raise ValueError("max_length trebuie să fie între 128 și 4096")
+        return v
+    
+    @validator('num_beams')
+    def validate_num_beams(cls, v):
+        if v < 1 or v > 5:
+            raise ValueError("num_beams trebuie să fie între 1 și 5")
+        return v
+
+class BatchTranslationRequest(BaseModel):
+    texts: list[str]
+    source_lang: str = "English"
+    target_lang: str = "Romanian"
+    max_length: int = 2048
+    
+    @validator('texts')
+    def validate_texts(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("Lista de texte nu poate fi goală")
+        if len(v) > 50:
+            raise ValueError("Maximum 50 texte per batch")
+        for text in v:
+            if len(text) > 15000:
+                raise ValueError("Unul dintre texte depășește 15000 caractere")
+        return v
+
+@app.on_event("startup")
+async def load_model():
+    global model, tokenizer
+    logger.info(f"🚀 Se inițializează Specialistul: {MODEL_ID}...")
+    logger.info("ℹ️ Arhitectura: Decoder-Only (LLM) - LLaMA Based")
+    
+    try:
+        # Configurare Cuantizare 8-bit
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False
         )
-        adapter = HTTPAdapter(max_retries=retries)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
 
-        # Configurare Legacy (Ollama / Fallback)
-        self._ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        self._ollama_models = [
-            os.getenv("OLLAMA_MODEL_PRIMARY", "llama3:70b"),
-            os.getenv("OLLAMA_MODEL_FALLBACK", "qwen:14b"),
+        # Încărcare Tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_ID,
+            trust_remote_code=True,
+            use_fast=True
+        )
+        
+        # Setare padding token dacă lipsește
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Încărcare Model
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
+        
+        model.eval()  # Setare modul evaluare
+        
+        logger.info(f"✅ X-ALMA Group2 Încărcat! VRAM optimizată cu 8-bit quantization.")
+        logger.info(f"📊 Device map: {model.hf_device_map}")
+        
+    except Exception as e:
+        logger.error(f"❌ Eroare la încărcare: {e}", exc_info=True)
+        raise e
+
+@app.get("/health")
+async def health_check():
+    """Verifică starea serverului și modelului"""
+    cuda_available = torch.cuda.is_available()
+    vram_allocated = torch.cuda.memory_allocated(0) / 1024**3 if cuda_available else 0
+    vram_reserved = torch.cuda.memory_reserved(0) / 1024**3 if cuda_available else 0
+    
+    return {
+        "status": "healthy" if model is not None else "loading",
+        "model": MODEL_ID,
+        "model_loaded": model is not None,
+        "device": "cuda" if cuda_available else "cpu",
+        "vram_allocated_gb": round(vram_allocated, 2),
+        "vram_reserved_gb": round(vram_reserved, 2)
+    }
+
+@app.post("/translate")
+async def translate_text(request: TranslationRequest):
+    """Traduce un singur text"""
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
+
+    logger.info(f"📝 Traducere: {request.source_lang} -> {request.target_lang}, "
+                f"{len(request.text)} caractere")
+    
+    # Prompt simplu și clar (X-ALMA preferă simplitate)
+    prompt = f"Translate this from {request.source_lang} to {request.target_lang}:\n{request.text}"
+    
+    messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        text_input = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    except Exception:
+        # Fallback dacă chat template nu funcționează
+        text_input = prompt
+    
+    inputs = tokenizer(
+        [text_input],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=4096
+    ).to("cuda")
+
+    try:
+        with torch.no_grad():
+            generated_ids = model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=request.max_length,
+                num_beams=request.num_beams if request.use_beam_search else 1,
+                do_sample=False,
+                temperature=None,
+                repetition_penalty=1.15,
+                length_penalty=1.0,
+                early_stopping=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                no_repeat_ngram_size=3
+            )
+
+        # Elimină promptul din output
+        generated_ids = [
+            output_ids[len(input_ids):] 
+            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
         ]
-
-        # Mapare simplă pentru coduri Whisper -> Nume complete (preferate de ALMA/Qwen)
-        self._lang_map = {
-            "ro": "Romanian", "en": "English", "fr": "French", 
-            "de": "German", "it": "Italian", "es": "Spanish",
-            "ru": "Russian", "zh": "Chinese", "ja": "Japanese",
-            "pt": "Portuguese"
-        }
         
-        # Flag intern pentru a loga succesul conexiunii o singură dată
-        self._server_connected_once = False
-
-    # ------------ Internals ------------
-    def _load_model(self):
-        if self._model is None:
-            # Lazy loading pentru a evita costul la import
-            self._model = whisper.load_model(self.whisper_model_name)
-        return self._model
-
-    def _map_lang_code(self, code: str) -> str:
-        """Convertește 'en' -> 'English' pentru prompt-ul modelului LLM."""
-        if not code: return "English"
-        return self._lang_map.get(code.lower(), code.title())
-
-    def _transcribe(self, filepath: str):
-        model = self._load_model()
-        # verbose=False reduce zgomotul în consolă
-        result = model.transcribe(filepath, task="transcribe", verbose=False)
-        segments = result.get("segments", [])
-        language = result.get("language", "auto")
-        return segments, language
-
-    def _translate_via_server(self, text: str, source_code: str, target_code: str) -> str:
-        """
-        Trimite cerere către serverul local Python (FastAPI) de pe portul 8001.
-        """
-        source_lang = self._map_lang_code(source_code)
-        target_lang = self._map_lang_code(target_code)
+        response_text = tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )[0]
         
-        payload = {
-            "text": text,
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "temperature": 0.1 # Temperatură mică pentru fidelitate maximă
-        }
-
-        try:
-            # Timeout crescut la 60s pentru modele mari care pot avea latență la primul request
-            resp = self._session.post(self._local_server_url, json=payload, timeout=60)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("translation", "").strip()
-            else:
-                logging.warning(f"[SUBTITLE] Server Error {resp.status_code}: {resp.text}")
-                return ""
-                
-        except requests.exceptions.ConnectionError:
-            # Aceasta este eroarea critică dacă serverul nu merge
-            logging.error(f"[SUBTITLE] 🛑 EROARE CONEXIUNE: Nu pot accesa {self._local_server_url}")
-            return "CONNECTION_ERROR"
-        except Exception as e:
-            logging.warning(f"[SUBTITLE] Eroare generală traducere server: {e}")
-            return ""
-
-    def _translate_ollama(self, text: str, target_lang: str) -> str:
-        """Fallback method pentru Ollama standard."""
-        try:
-            system_prompt = (
-                f"Ești un traducător profesionist. Tradu textul EXACT în limba {target_lang}. "
-                f"Păstrează sensul, numele proprii și ordinea logică. "
-                f"Output-ul trebuie să conțină DOAR traducerea."
-            )
-            user_prompt = f"Text: {text}\nTraducere:"
-            
-            for mdl in self._ollama_models:
-                try:
-                    resp = requests.post(
-                        f"{self._ollama_host}/v1/completions",
-                        json={
-                            "model": mdl,
-                            "prompt": f"{system_prompt}\n\n{user_prompt}",
-                            "options": {"temperature": 0.1},
-                        },
-                        timeout=60,
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        txt = (data.get("choices") or [{}])[0].get("text", "").strip()
-                        if txt: return txt
-                except:
-                    continue
-        except Exception as e:
-            logging.warning(f"[SUBTITLE] Ollama fallback failed: {e}")
-        return ""
-
-    def _translate_segments(
-        self, 
-        segments: List[dict], 
-        source_lang_detected: str, 
-        target_lang: str, 
-        mode: str = "local_server"
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Returnează (texte_traduse, texte_originale).
-        """
-        translated, originals = [], []
+        # CURĂȚARE OUTPUT
+        cleaned_text = clean_translation_output(response_text)
         
-        # Inițializăm Cloud Translator doar dacă e cerut explicit sau ca fallback
-        cloud_translator = None
-        
-        server_available = True
-        
-        # Resetăm flag-ul de conexiune pentru acest job
-        self._server_connected_once = False
-
-        for i, seg in enumerate(segments):
-            orig = (seg.get("text") or "").strip()
-            originals.append(orig)
-            
-            if not orig:
-                translated.append("")
-                continue
-
-            # Logica de selecție a metodei
-            translation = ""
-
-            # 1. Încercăm Serverul Local High-End (Prioritate)
-            if mode == "local_server" and server_available:
-                translation = self._translate_via_server(orig, source_lang_detected, target_lang)
-                
-                if translation == "CONNECTION_ERROR":
-                    logging.warning("[SUBTITLE] ⚠️ Serverul local nu a răspuns. Comutăm automat pe Google Translate.")
-                    server_available = False # Circuit breaker: oprim încercările spre server
-                    translation = "" 
-                elif translation:
-                    # Logăm succesul o singură dată per video, ca să știm că merge
-                    if not self._server_connected_once:
-                        logging.info(f"[SUBTITLE] ✅ Conexiune stabilă cu Serverul Local ({self._local_server_url}). Traducere neurală activă.")
-                        self._server_connected_once = True
-                
-                # Dacă translation e gol dar nu e connection error, serverul a returnat gol -> încercăm fallback
-
-            # 2. Fallback: Google Translate (dacă serverul a picat sau mode="cloud")
-            if not translation:
-                try:
-                    if not cloud_translator:
-                        # Inițializare lazy
-                        cloud_translator = GoogleTranslator(source="auto", target=target_lang)
-                    translation = cloud_translator.translate(orig)
-                except Exception as e:
-                    # Log doar la debug ca să nu umplem consola
-                    logging.debug(f"Google translate fail: {e}")
-
-            # 3. Fallback Ultim: Ollama vechi (dacă există și Google a eșuat)
-            if not translation:
-                translation = self._translate_ollama(orig, target_lang)
-
-            # 4. Fail-safe: Originalul
-            translated.append(translation if translation else orig)
-
-            # Log progress discret (la fiecare 10 segmente)
-            if i % 10 == 0:
-                logging.info(f"[SUBTITLE] Tradus segment {i}/{len(segments)}")
-
-        return translated, originals
-
-    def _write_srt(self, segments: List[dict], texts: List[str], srt_path: Path):
-        subs = pysubs2.SSAFile()
-        for seg, txt in zip(segments, texts):
-            start_ms = int(float(seg.get("start", 0)) * 1000)
-            end_ms = int(float(seg.get("end", 0)) * 1000)
-            event = pysubs2.SSAEvent(start=start_ms, end=end_ms, text=txt)
-            subs.append(event)
-        subs.save(str(srt_path), encoding="utf-8")
-
-    def _burn_subtitles(self, video_path: Path, srt_path: Path, output_path: Path):
-        srt_escaped = srt_path.as_posix().replace("'", r"\\'")
-        (
-            ffmpeg
-            .input(str(video_path))
-            .output(
-                str(output_path),
-                vf=f"subtitles='{srt_escaped}'",
-                acodec="copy",
-                vcodec="libx264",
-                preset="fast",
-                crf=18,
-            )
-            .overwrite_output()
-            .run(quiet=True)
-        )
-
-    def _probe_duration(self, video_path: Path) -> float:
-        try:
-            meta = ffmpeg.probe(str(video_path))
-            for stream in meta.get("streams", []):
-                if stream.get("codec_type") == "video" and stream.get("duration"):
-                    return float(stream["duration"])
-            if "format" in meta and meta["format"].get("duration"):
-                return float(meta["format"]["duration"])
-        except Exception:
-            return 0.0
-        return 0.0
-
-    def _estimate_timeline(self, duration: float, attach_mode: str):
-        rt_factor = 1.2
-        translate_factor = 0.3 # Puțin mai mult pentru inferență locală de calitate
-        burn_factor = 0.5
-        summary_factor = 0.15
-
-        duration = max(duration, 60.0)
-        est_transcribe = duration * rt_factor
-        est_translate = duration * translate_factor
-        est_burn = duration * burn_factor if attach_mode == "hard" else 0.0
-        est_summary = duration * summary_factor
+        logger.info(f"✅ Traducere completă: {len(cleaned_text)} caractere")
         
         return {
-            "transcribe": est_transcribe,
-            "translate": est_translate,
-            "burn": est_burn,
-            "summary": est_summary,
-            "total": est_transcribe + est_translate + est_burn + est_summary + 10.0,
+            "source": request.source_lang,
+            "target": request.target_lang,
+            "model": "X-ALMA-13B-Group2",
+            "translation": cleaned_text,
+            "raw_output": response_text,  # Pentru debugging
+            "stats": {
+                "chars_in": len(request.text),
+                "chars_out": len(cleaned_text),
+                "tokens_generated": len(generated_ids[0])
+            }
         }
 
-    def _run_stage(self, label: str, expected_seconds: float, base_percent: float, weight_percent: float, func):
-        start = time.time()
-        done = threading.Event()
+    except torch.cuda.OutOfMemoryError:
+        logger.error("❌ VRAM insuficient!")
+        torch.cuda.empty_cache()
+        raise HTTPException(status_code=507, detail="VRAM insuficient. Încearcă un text mai scurt.")
+    except Exception as e:
+        logger.error(f"❌ Eroare la traducere: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
+    finally:
+        # Curățare memorie după fiecare request
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        def ticker():
-            while not done.is_set():
-                elapsed = time.time() - start
-                ratio = min(1.0, elapsed / max(expected_seconds, 0.1))
-                percent = base_percent + ratio * weight_percent
-                eta = max(0.0, (self._total_expected or expected_seconds) - (time.time() - self._global_start))
-                send_task_progress(percent=percent, eta_seconds=eta, stage=label, detail="în curs")
-                time.sleep(1.0)
+@app.post("/translate/batch")
+async def translate_batch(request: BatchTranslationRequest):
+    """Traduce multiple texte simultan (mai eficient)"""
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
 
-        t = threading.Thread(target=ticker, daemon=True)
-        t.start()
-        try:
-            result = func()
-        finally:
-            done.set()
-            t.join(timeout=0.2)
+    logger.info(f"📦 Batch traducere: {len(request.texts)} texte, "
+                f"{request.source_lang} -> {request.target_lang}")
+    
+    prompts = [
+        f"Translate this from {request.source_lang} to {request.target_lang}:\n{text}"
+        for text in request.texts
+    ]
+    
+    try:
+        # Procesare batch
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096
+        ).to("cuda")
 
-        percent = base_percent + weight_percent
-        eta = max(0.0, (self._total_expected or expected_seconds) - (time.time() - self._global_start))
-        send_task_progress(percent=percent, eta_seconds=eta, stage=label, detail="finalizat")
-        return result
-
-    # ------------ API publică ------------
-    def generate(self, filepath: str, lang: str = "ro", attach_mode: str = "soft", detail_level: str = "medium", translator_mode: str = "local_server"):
-        """
-        Generează subtitrare.
-        
-        Args:
-            translator_mode: 'local_server' (Recomandat - RTX 5090), 'cloud' (Google), 'ollama'.
-        """
-        video_path = Path(filepath)
-        attach_mode = (attach_mode or "soft").lower()
-        translator_mode = (translator_mode or "local_server").lower()
-        
-        print(f"[SUBTITLE] Start: Mode={attach_mode}, Translator={translator_mode}")
-        self._global_start = time.time()
-
-        duration = self._probe_duration(video_path)
-        timeline = self._estimate_timeline(duration, attach_mode)
-        self._total_expected = timeline["total"]
-
-        # Ponderi progres
-        pct_transcribe = 50.0
-        pct_translate = 30.0 # Creștem ponderea traducerii fiind neurală
-        pct_summary = 10.0
-        pct_burn = 0.0 if attach_mode != "hard" else 10.0
-        
-        send_task_progress(percent=1.0, eta_seconds=timeline["total"], stage="init", detail="pregătire")
-
-        # 1. Transcriere
-        segments, detected_lang = self._run_stage(
-            "transcriere",
-            timeline["transcribe"], 0.0, pct_transcribe,
-            lambda: self._transcribe(str(video_path)),
-        )
-        print(f"[SUBTITLE] Limbă detectată: {detected_lang}")
-
-        # 2. Traducere (Aici e magia nouă)
-        print(f"[SUBTITLE] Începe traducerea cu {translator_mode}...")
-        translated_texts, originals = self._run_stage(
-            "traducere",
-            timeline["translate"], pct_transcribe, pct_translate,
-            lambda: self._translate_segments(
-                segments, 
-                source_lang_detected=detected_lang, 
-                target_lang=lang, 
-                mode=translator_mode
-            ),
-        )
-
-        # 3. Scriere SRT
-        srt_path = self.processed_dir / f"{video_path.stem}_{lang}.srt"
-        self._write_srt(segments, translated_texts, srt_path)
-
-        # 4. Rezumat
-        full_text = "\n".join(translated_texts)
-        summary_result = self._run_stage(
-            "rezumat",
-            timeline["summary"], pct_transcribe + pct_translate, pct_summary,
-            lambda: self._summary_service.summarize_content(
-                content_id=video_path.stem,
-                text=full_text,
-                metadata={"source": "video", "lang": lang, "detail": detail_level},
-            ),
-        )
-
-        response = {
-            "attach_mode": attach_mode,
-            "subtitle_file": f"/download/{srt_path.name}",
-            "subtitle_language": lang,
-            "detected_language": detected_lang,
-            "segments": len(segments),
-            "summary": summary_result.get("summary"),
-        }
-
-        # 5. Hard Burn (Opțional)
-        if attach_mode == "hard":
-            output_video = self.processed_dir / f"{video_path.stem}_{lang}_subtitled.mp4"
-            self._run_stage(
-                "burn",
-                timeline["burn"], pct_transcribe + pct_translate + pct_summary, pct_burn,
-                lambda: self._burn_subtitles(video_path, srt_path, output_video),
+        with torch.no_grad():
+            generated_ids = model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=request.max_length,
+                num_beams=2,  # Redus pentru batch
+                do_sample=False,
+                repetition_penalty=1.15,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
             )
-            response["video_file"] = f"/download/{output_video.name}"
-        else:
-            response["video_file"] = f"/download/{srt_path.name}"
 
-        send_task_progress(percent=100.0, eta_seconds=0.0, stage="gata", detail="complet")
-        return response
+        # Elimină prompturile
+        generated_ids = [
+            output_ids[len(input_ids):]
+            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        
+        response_texts = tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+        
+        # Curățare pentru fiecare output
+        cleaned_texts = [clean_translation_output(text) for text in response_texts]
+        
+        logger.info(f"✅ Batch completat: {len(cleaned_texts)} traduceri")
+        
+        return {
+            "source": request.source_lang,
+            "target": request.target_lang,
+            "model": "X-ALMA-13B-Group2",
+            "translations": cleaned_texts,
+            "count": len(cleaned_texts)
+        }
+
+    except torch.cuda.OutOfMemoryError:
+        logger.error("❌ VRAM insuficient pentru batch!")
+        torch.cuda.empty_cache()
+        raise HTTPException(status_code=507, detail="VRAM insuficient. Reduce numărul de texte.")
+    except Exception as e:
+        logger.error(f"❌ Eroare la batch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+@app.post("/translate/debug")
+async def translate_debug(request: TranslationRequest):
+    """
+    Endpoint de debugging care returnează atât outputul curat cât și raw,
+    pentru a testa pattern-urile de curățare
+    """
+    if not model or not tokenizer:
+        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
+
+    prompt = f"Translate this from {request.source_lang} to {request.target_lang}:\n{request.text}"
+    messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except:
+        text_input = prompt
+    
+    inputs = tokenizer([text_input], return_tensors="pt").to("cuda")
+
+    try:
+        with torch.no_grad():
+            generated_ids = model.generate(
+                inputs.input_ids,
+                max_new_tokens=request.max_length,
+                num_beams=request.num_beams,
+                do_sample=False,
+                repetition_penalty=1.15,
+                pad_token_id=tokenizer.pad_token_id
+            )
+
+        generated_ids = [
+            output_ids[len(input_ids):] 
+            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        
+        response_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        cleaned_text = clean_translation_output(response_text)
+        
+        return {
+            "raw_output": response_text,
+            "cleaned_output": cleaned_text,
+            "removed_chars": len(response_text) - len(cleaned_text),
+            "prompt_used": text_input
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "alma_server:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        workers=1,
+        log_level="info"
+    )
