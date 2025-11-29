@@ -14,364 +14,123 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURARE MODEL ---
-MODEL_ID = "haoranxu/X-ALMA-13B-Group2"
+# QwQ-32B-Preview: Model de reasoning foarte puternic
+MODEL_ID = "Qwen/QwQ-32B-Preview"
 HOST = "0.0.0.0"
-PORT = 8001
+PORT = 8002  # Port diferit față de ALMA (8001)
 
 app = FastAPI(
-    title="X-ALMA Translation API (Romanian Specialist)",
-    version="5.0",
-    description="API de traducere optimizat pentru română folosind X-ALMA-13B-Group2"
+    title="QwQ-32B Translation API (Reasoning Specialist)",
+    version="1.0",
+    description="API de traducere strictă folosind QwQ-32B cu suprimarea reasoning-ului"
 )
 
 model = None
 tokenizer = None
 
-# --- PATTERN-URI PENTRU CURĂȚARE ---
-CLEANUP_PATTERNS = [
-    # Ghilimele și apostrof
-    (r'^["\'](.+)["\']$', r'\1'),
-    (r'^"(.+)"$', r'\1'),
-    (r"^'(.+)'$", r'\1'),
-    
-    # Prefixe comune în răspunsuri (case insensitive)
-    (r'^(?:Traducere|Translation|Răspuns|Raspuns|Answer|Result|Output)\s*:\s*', '', re.IGNORECASE),
-    (r'^(?:În|In)\s+(?:limba\s+)?(?:română|romana|romană|english)\s*:\s*', '', re.IGNORECASE),
-    (r'^(?:Here is the translation|Iată traducerea)\s*:\s*', '', re.IGNORECASE),
-    
-    # Markdown și formatare
-    (r'^\*\*(.+)\*\*$', r'\1'),
-    (r'^`(.+)`$', r'\1'),
-    
-    # Spații multiple și newline-uri la început/final
-    (r'^\s+|\s+$', ''),
-    (r'\n{3,}', '\n\n'),
-]
-
-def clean_translation_output(text: str) -> str:
-    """
-    Curăță outputul de la model eliminând:
-    - Ghilimele redundante
-    - Prefixe de tip "Răspuns:", "In limba romana:", etc.
-    - Formatare markdown inutilă
-    - Spații excesive
-    """
-    if not text:
-        return text
-    
-    cleaned = text.strip()
-    
-    # Aplică toate pattern-urile de curățare
-    for pattern_data in CLEANUP_PATTERNS:
-        if len(pattern_data) == 2:
-            pattern, replacement = pattern_data
-            flags = 0
-        else:
-            pattern, replacement, flags = pattern_data
-        
-        cleaned = re.sub(pattern, replacement, cleaned, flags=flags)
-        cleaned = cleaned.strip()
-    
-    # Elimină ghilimele doar la început și final (nu din mijlocul textului)
-    if cleaned.startswith('"') and cleaned.endswith('"'):
-        cleaned = cleaned[1:-1].strip()
-    if cleaned.startswith("'") and cleaned.endswith("'"):
-        cleaned = cleaned[1:-1].strip()
-    
-    # Curăță spații multiple
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-    
-    # Restaurează newline-uri normale (păstrează paragrafele)
-    cleaned = re.sub(r'\s*\n\s*', '\n', cleaned)
-    
-    logger.debug(f"Curățare: '{text[:50]}...' -> '{cleaned[:50]}...'")
-    
-    return cleaned
-
 class TranslationRequest(BaseModel):
     text: str
     source_lang: str = "English"
     target_lang: str = "Romanian"
-    max_length: int = 2048
-    use_beam_search: bool = True
-    num_beams: int = 3
+    max_length: int = 4096
     
     @validator('text')
     def validate_text(cls, v):
         if not v or len(v.strip()) == 0:
             raise ValueError("Textul nu poate fi gol")
-        if len(v) > 15000:
-            raise ValueError("Text prea lung (max 15000 caractere pentru context mare)")
         return v.strip()
-    
-    @validator('max_length')
-    def validate_max_length(cls, v):
-        if v < 128 or v > 4096:
-            raise ValueError("max_length trebuie să fie între 128 și 4096")
-        return v
-    
-    @validator('num_beams')
-    def validate_num_beams(cls, v):
-        if v < 1 or v > 5:
-            raise ValueError("num_beams trebuie să fie între 1 și 5")
-        return v
 
-class BatchTranslationRequest(BaseModel):
-    texts: list[str]
-    source_lang: str = "English"
-    target_lang: str = "Romanian"
-    max_length: int = 2048
+def clean_qwq_output(text: str) -> str:
+    """
+    Curăță outputul specific modelelor de reasoning (QwQ/DeepSeek).
+    Elimină tag-urile <think> și explicațiile.
+    """
+    if not text:
+        return ""
+
+    # 1. Elimină blocuri de gândire <think>...</think> (inclusiv pe mai multe linii)
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     
-    @validator('texts')
-    def validate_texts(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("Lista de texte nu poate fi goală")
-        if len(v) > 50:
-            raise ValueError("Maximum 50 texte per batch")
-        for text in v:
-            if len(text) > 15000:
-                raise ValueError("Unul dintre texte depășește 15000 caractere")
-        return v
+    # 2. Elimină doar tag-urile rămase (dacă modelul a uitat să le închidă)
+    cleaned = re.sub(r'<think>', '', cleaned)
+    cleaned = re.sub(r'</think>', '', cleaned)
+
+    # 3. Elimină prefixe comune de chat
+    patterns = [
+        r'^(?:Here is the translation|Translation|Traducere|Răspuns):',
+        r'^Sure, here is.*?:',
+        r'^Certainly.*?:',
+    ]
+    for p in patterns:
+        cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE)
+
+    # 4. Elimină ghilimele exterioare
+    cleaned = cleaned.strip()
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1]
+    
+    return cleaned.strip()
 
 @app.on_event("startup")
 async def load_model():
     global model, tokenizer
-    logger.info(f"🚀 Se inițializează Specialistul: {MODEL_ID}...")
-    logger.info("ℹ️ Arhitectura: Decoder-Only (LLM) - LLaMA Based")
+    logger.info(f"🚀 Se inițializează QwQ-32B: {MODEL_ID}...")
+    logger.info("ℹ️ Optimizare: 4-bit NF4 (Mandatoriu pentru 32B pe 32GB VRAM)")
     
     try:
-        # Configurare Cuantizare 8-bit
+        # Configurare Cuantizare 4-bit (NF4)
+        # 32B params * 0.5 bytes = ~16GB VRAM modelul + context overhead
         bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True
         )
 
-        # Încărcare Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            trust_remote_code=True,
-            use_fast=True
-        )
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
         
-        # Setare padding token dacă lipsește
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        # Încărcare Model
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
+            trust_remote_code=True
         )
         
-        model.eval()  # Setare modul evaluare
-        
-        logger.info(f"✅ X-ALMA Group2 Încărcat! VRAM optimizată cu 8-bit quantization.")
-        logger.info(f"📊 Device map: {model.hf_device_map}")
+        logger.info(f"✅ QwQ-32B Încărcat pe Portul {PORT}!")
         
     except Exception as e:
-        logger.error(f"❌ Eroare la încărcare: {e}", exc_info=True)
+        logger.error(f"❌ Eroare la încărcare QwQ: {e}", exc_info=True)
         raise e
-
-@app.get("/health")
-async def health_check():
-    """Verifică starea serverului și modelului"""
-    cuda_available = torch.cuda.is_available()
-    vram_allocated = torch.cuda.memory_allocated(0) / 1024**3 if cuda_available else 0
-    vram_reserved = torch.cuda.memory_reserved(0) / 1024**3 if cuda_available else 0
-    
-    return {
-        "status": "healthy" if model is not None else "loading",
-        "model": MODEL_ID,
-        "model_loaded": model is not None,
-        "device": "cuda" if cuda_available else "cpu",
-        "vram_allocated_gb": round(vram_allocated, 2),
-        "vram_reserved_gb": round(vram_reserved, 2)
-    }
 
 @app.post("/translate")
 async def translate_text(request: TranslationRequest):
-    """Traduce un singur text"""
     if not model or not tokenizer:
         raise HTTPException(status_code=503, detail="Modelul se încarcă...")
 
-    logger.info(f"📝 Traducere: {request.source_lang} -> {request.target_lang}, "
-                f"{len(request.text)} caractere")
+    # --- PROMPT STRICT PENTRU QwQ ---
+    # QwQ tinde să gândească mult. Îl forțăm să fie direct.
+    system_instruction = (
+        "You are a strict translation engine. Your ONLY task is to translate the input text. "
+        "Rules:\n"
+        "1. Output ONLY the translation.\n"
+        "2. Do NOT output reasoning, thinking process, or <think> tags.\n"
+        "3. Do NOT provide explanations, notes, or introductions.\n"
+        "4. Maintain the tone and style of the original text."
+    )
     
-    # Prompt simplu și clar (X-ALMA preferă simplitate)
-    prompt = f"Translate this from {request.source_lang} to {request.target_lang}:\n{request.text}"
-    
-    messages = [{"role": "user", "content": prompt}]
-    
-    try:
-        text_input = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    except Exception:
-        # Fallback dacă chat template nu funcționează
-        text_input = prompt
-    
-    inputs = tokenizer(
-        [text_input],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=4096
-    ).to("cuda")
+    user_content = f"Translate from {request.source_lang} to {request.target_lang}:\n{request.text}"
 
-    try:
-        with torch.no_grad():
-            generated_ids = model.generate(
-                inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=request.max_length,
-                num_beams=request.num_beams if request.use_beam_search else 1,
-                do_sample=False,
-                temperature=None,
-                repetition_penalty=1.15,
-                length_penalty=1.0,
-                early_stopping=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                no_repeat_ngram_size=3
-            )
-
-        # Elimină promptul din output
-        generated_ids = [
-            output_ids[len(input_ids):] 
-            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        
-        response_text = tokenizer.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )[0]
-        
-        # CURĂȚARE OUTPUT
-        cleaned_text = clean_translation_output(response_text)
-        
-        logger.info(f"✅ Traducere completă: {len(cleaned_text)} caractere")
-        
-        return {
-            "source": request.source_lang,
-            "target": request.target_lang,
-            "model": "X-ALMA-13B-Group2",
-            "translation": cleaned_text,
-            "raw_output": response_text,  # Pentru debugging
-            "stats": {
-                "chars_in": len(request.text),
-                "chars_out": len(cleaned_text),
-                "tokens_generated": len(generated_ids[0])
-            }
-        }
-
-    except torch.cuda.OutOfMemoryError:
-        logger.error("❌ VRAM insuficient!")
-        torch.cuda.empty_cache()
-        raise HTTPException(status_code=507, detail="VRAM insuficient. Încearcă un text mai scurt.")
-    except Exception as e:
-        logger.error(f"❌ Eroare la traducere: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
-    finally:
-        # Curățare memorie după fiecare request
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-@app.post("/translate/batch")
-async def translate_batch(request: BatchTranslationRequest):
-    """Traduce multiple texte simultan (mai eficient)"""
-    if not model or not tokenizer:
-        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
-
-    logger.info(f"📦 Batch traducere: {len(request.texts)} texte, "
-                f"{request.source_lang} -> {request.target_lang}")
-    
-    prompts = [
-        f"Translate this from {request.source_lang} to {request.target_lang}:\n{text}"
-        for text in request.texts
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": user_content}
     ]
     
-    try:
-        # Procesare batch
-        inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=4096
-        ).to("cuda")
-
-        with torch.no_grad():
-            generated_ids = model.generate(
-                inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=request.max_length,
-                num_beams=2,  # Redus pentru batch
-                do_sample=False,
-                repetition_penalty=1.15,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
-            )
-
-        # Elimină prompturile
-        generated_ids = [
-            output_ids[len(input_ids):]
-            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        
-        response_texts = tokenizer.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-        
-        # Curățare pentru fiecare output
-        cleaned_texts = [clean_translation_output(text) for text in response_texts]
-        
-        logger.info(f"✅ Batch completat: {len(cleaned_texts)} traduceri")
-        
-        return {
-            "source": request.source_lang,
-            "target": request.target_lang,
-            "model": "X-ALMA-13B-Group2",
-            "translations": cleaned_texts,
-            "count": len(cleaned_texts)
-        }
-
-    except torch.cuda.OutOfMemoryError:
-        logger.error("❌ VRAM insuficient pentru batch!")
-        torch.cuda.empty_cache()
-        raise HTTPException(status_code=507, detail="VRAM insuficient. Reduce numărul de texte.")
-    except Exception as e:
-        logger.error(f"❌ Eroare la batch: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-@app.post("/translate/debug")
-async def translate_debug(request: TranslationRequest):
-    """
-    Endpoint de debugging care returnează atât outputul curat cât și raw,
-    pentru a testa pattern-urile de curățare
-    """
-    if not model or not tokenizer:
-        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
-
-    prompt = f"Translate this from {request.source_lang} to {request.target_lang}:\n{request.text}"
-    messages = [{"role": "user", "content": prompt}]
-    
-    try:
-        text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    except:
-        text_input = prompt
+    # QwQ folosește template-ul standard ChatML sau Qwen
+    text_input = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
     
     inputs = tokenizer([text_input], return_tensors="pt").to("cuda")
 
@@ -380,39 +139,37 @@ async def translate_debug(request: TranslationRequest):
             generated_ids = model.generate(
                 inputs.input_ids,
                 max_new_tokens=request.max_length,
-                num_beams=request.num_beams,
-                do_sample=False,
-                repetition_penalty=1.15,
-                pad_token_id=tokenizer.pad_token_id
+                do_sample=False,       # Greedy decoding pentru strictețe maximă
+                temperature=None,      # Ignorat la greedy, dar setat explicit
+                top_p=None,            # Ignorat la greedy
+                repetition_penalty=1.1 # Previne buclele în traduceri lungi
             )
 
+        # Extrage doar răspunsul nou
         generated_ids = [
             output_ids[len(input_ids):] 
             for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
         ]
         
-        response_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        cleaned_text = clean_translation_output(response_text)
+        raw_output = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        # Curățare agresivă
+        cleaned_translation = clean_qwq_output(raw_output)
         
         return {
-            "raw_output": response_text,
-            "cleaned_output": cleaned_text,
-            "removed_chars": len(response_text) - len(cleaned_text),
-            "prompt_used": text_input
+            "source": request.source_lang,
+            "target": request.target_lang,
+            "model": "Qwen/QwQ-32B-Preview",
+            "translation": cleaned_translation
         }
 
+    except torch.cuda.OutOfMemoryError:
+        logger.error("❌ VRAM Insuficient pe QwQ!")
+        torch.cuda.empty_cache()
+        raise HTTPException(status_code=507, detail="VRAM Insuficient. Textul e prea lung pentru contextul rămas.")
     except Exception as e:
+        logger.error(f"Eroare inferență: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "alma_server:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-        workers=1,
-        log_level="info"
-    )
+    uvicorn.run("qwq_server:app", host=HOST, port=PORT, reload=False)
