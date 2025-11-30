@@ -1,31 +1,20 @@
 from __future__ import annotations
 
-import logging
 import os
+os.environ.pop("TORCH_FORCE_WEIGHTS_ONLY_LOAD", None)
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+import torch
+from torch.serialization import add_safe_globals, safe_globals
+from omegaconf import ListConfig
+
+add_safe_globals([ListConfig])
+import logging
 import threading
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import gc
-
-# ==========================================
-#  FIX CRITIC PENTRU PYTORCH 2.6+ / RTX 5090
-# ==========================================
-import torch
-
-# WhisperX nu a fost actualizat pentru noile reguli de securitate PyTorch.
-# Această funcție "păcălește" biblioteca să funcționeze corect.
-_original_torch_load = torch.load
-
-def _patched_torch_load(*args, **kwargs):
-    if 'weights_only' not in kwargs:
-        # Setăm False pentru a permite încărcarea modelelor vechi (pickle)
-        # Folosim False pentru compatibilitate maximă cu WhisperX
-        kwargs['weights_only'] = False
-    return _original_torch_load(*args, **kwargs)
-
-torch.load = _patched_torch_load
-# ==========================================
+import json
 
 import textwrap
 import requests
@@ -39,30 +28,21 @@ from services.category_v.summary_service import SummaryService
 
 
 class SubtitleQualityOptimizer:
-    """
-    Optimizare de bază:
-    - CPS (15-20) cât de cât ok
-    - durată minimă pe segment
-    - gap minim între segmente
-    """
-
+    """Optimizare CPS, durată, gap"""
     MAX_CHARS_PER_LINE = 42
     MAX_LINES = 2
-    MIN_DURATION = 0.8  # secunde
-    MAX_DURATION = 7.0  # secunde
-    MIN_GAP = 0.1       # secunde
-    MAX_CPS = 20        # characters per second
+    MIN_DURATION = 0.8
+    MAX_DURATION = 7.0
+    MIN_GAP = 0.1
+    MAX_CPS = 20
 
     @classmethod
-    def optimize_segments(
-        cls, segments: List[dict], texts: List[str]
-    ) -> Tuple[List[dict], List[str]]:
+    def optimize_segments(cls, segments: List[dict], texts: List[str]) -> Tuple[List[dict], List[str]]:
         if not segments:
             return segments, texts
 
         new_segments: List[dict] = []
         new_texts: List[str] = []
-
         i = 0
         n = len(segments)
 
@@ -73,7 +53,7 @@ class SubtitleQualityOptimizer:
             chars = len(text.replace("\n", ""))
             cps = chars / duration if duration > 0 else cls.MAX_CPS + 1
 
-            # 1) Merge dacă e prea rapid (CPS mare)
+            # Merge dacă CPS mare
             if cps > cls.MAX_CPS and i + 1 < n:
                 next_seg = segments[i + 1]
                 next_text = texts[i + 1]
@@ -92,18 +72,17 @@ class SubtitleQualityOptimizer:
                     i += 2
                     continue
 
-            # 2) Ajustare durată
+            # Ajustare durată
             if duration < cls.MIN_DURATION:
                 seg["end"] = seg["start"] + cls.MIN_DURATION
             elif duration > cls.MAX_DURATION:
-                # Aici doar limităm, nu putem re-segmenta ușor fără info de la whisper
                 seg["end"] = seg["start"] + cls.MAX_DURATION
 
             new_segments.append(seg)
             new_texts.append(text)
             i += 1
 
-        # 3) Gap minim
+        # Gap minim
         for i in range(len(new_segments) - 1):
             cur = new_segments[i]
             nxt = new_segments[i + 1]
@@ -118,13 +97,240 @@ class SubtitleQualityOptimizer:
         return new_segments, new_texts
 
 
+class BatchTranslationRefiner:
+    """
+    🚀 NOI: Post-procesare inteligentă în batch-uri
+    
+    Rafinează traduceri pentru:
+    - Consistență terminologică
+    - Coerență narrativă
+    - Flow natural între segmente
+    - Corectare greșeli contextuale
+    """
+    
+    BATCH_SIZE = 10  # Procesăm câte 10 segmente odată
+    
+    def __init__(self, ollama_host: str, ollama_model: str):
+        self._ollama_host = ollama_host
+        self._ollama_model = ollama_model
+    
+    def refine_batch(
+        self, 
+        batch_segments: List[dict],
+        batch_translations: List[str],
+        batch_originals: List[str],
+        target_lang: str,
+        global_context: str = ""
+    ) -> List[str]:
+        """
+        Rafinează un batch de traduceri pentru consistență și coerență.
+        
+        Args:
+            batch_segments: Lista de segmente (cu timpi)
+            batch_translations: Traduceri inițiale
+            batch_originals: Texte originale
+            target_lang: Limba țintă
+            global_context: Context general (ex: "conversație despre tehnologie")
+        
+        Returns:
+            Lista de traduceri rafinate
+        """
+        if not batch_translations:
+            return batch_translations
+        
+        # Construim JSON cu toate segmentele pentru LLM
+        batch_data = []
+        for i, (seg, trans, orig) in enumerate(zip(batch_segments, batch_translations, batch_originals)):
+            batch_data.append({
+                "index": i,
+                "original": orig,
+                "translation": trans,
+                "timestamp": f"{seg['start']:.1f}s - {seg['end']:.1f}s",
+                "speaker": seg.get("speaker", "unknown")
+            })
+        
+        system_prompt = self._build_refiner_system_prompt(target_lang, global_context)
+        user_prompt = self._build_refiner_user_prompt(batch_data, target_lang)
+        
+        try:
+            response = requests.post(
+                f"{self._ollama_host}/v1/completions",
+                json={
+                    "model": self._ollama_model,
+                    "prompt": f"{system_prompt}\n\n{user_prompt}",
+                    "options": {
+                        "temperature": 0.2,  # Mai deterministă pentru consistență
+                        "top_p": 0.9,
+                        "max_tokens": 2000,
+                        "stop": ["###END###"],
+                    },
+                    "stream": False,
+                },
+                timeout=120,
+            )
+            
+            if not response.ok:
+                logging.warning(f"[REFINER] Ollama failed: {response.status_code}")
+                return batch_translations
+            
+            data = response.json()
+            result_text = (data.get("choices") or [{}])[0].get("text", "").strip()
+            
+            # Parse JSON response
+            refined = self._parse_refinement_response(result_text, batch_translations)
+            return refined
+            
+        except Exception as e:
+            logging.warning(f"[REFINER] Error: {e}")
+            return batch_translations
+    
+    def _build_refiner_system_prompt(self, target_lang: str, global_context: str) -> str:
+        context_line = f"\nGlobal context: {global_context}" if global_context else ""
+        
+        return f"""You are an expert subtitle post-editor for {target_lang} language.
+
+Your task: Review and refine a batch of subtitle translations to ensure:
+
+1. CONSISTENCY
+   - Same terms/names translated identically throughout
+   - Uniform style and register
+   - Consistent speaker voice
+
+2. COHERENCE
+   - Smooth narrative flow between segments
+   - Logical conversational continuity
+   - Natural dialogue progression
+
+3. QUALITY
+   - Natural, spoken language (not literal translation)
+   - Appropriate subtitle length (max 42 chars/line, 2 lines)
+   - Cultural adaptation when needed
+   - Preserve emotional tone
+
+4. ACCURACY
+   - Keep original meaning
+   - Don't add or remove information
+   - Fix awkward phrasings from initial translation{context_line}
+
+OUTPUT FORMAT: Return ONLY a valid JSON array with refined translations:
+[
+  {{"index": 0, "refined": "refined translation here"}},
+  {{"index": 1, "refined": "another refined translation"}},
+  ...
+]
+
+CRITICAL: Output ONLY the JSON array, no explanations, no markdown, no extra text."""
+
+    def _build_refiner_user_prompt(self, batch_data: List[dict], target_lang: str) -> str:
+        batch_json = json.dumps(batch_data, ensure_ascii=False, indent=2)
+        
+        return f"""Batch of subtitles to refine (target language: {target_lang}):
+
+{batch_json}
+
+Instructions:
+1. Review all translations in this batch
+2. Ensure consistency in terminology (e.g., if "computer" appears multiple times, use same translation)
+3. Make dialogue flow naturally between segments
+4. Fix any awkward or overly literal translations
+5. Keep subtitle constraints: max 84 chars total (42/line × 2 lines)
+6. Preserve meaning and tone
+
+Return refined translations as JSON array with format:
+[{{"index": 0, "refined": "..."}}, {{"index": 1, "refined": "..."}}, ...]"""
+
+    def _parse_refinement_response(self, response_text: str, fallback: List[str]) -> List[str]:
+        """Parse LLM response și extrage traducerile rafinate"""
+        try:
+            # Curățăm potențiale markdown wrappers
+            clean_text = response_text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            if clean_text.startswith("```"):
+                clean_text = clean_text[3:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            clean_text = clean_text.strip()
+            
+            # Parse JSON
+            refined_data = json.loads(clean_text)
+            
+            if not isinstance(refined_data, list):
+                logging.warning("[REFINER] Response not a list")
+                return fallback
+            
+            # Sortăm după index și extragem traducerile
+            refined_data.sort(key=lambda x: x.get("index", 0))
+            refined_translations = [item.get("refined", "") for item in refined_data]
+            
+            # Validare: dacă nu am tot, folosim fallback
+            if len(refined_translations) != len(fallback):
+                logging.warning(f"[REFINER] Length mismatch: {len(refined_translations)} vs {len(fallback)}")
+                return fallback
+            
+            # Verificăm că nu sunt empty strings
+            if any(not t.strip() for t in refined_translations):
+                logging.warning("[REFINER] Some refined translations are empty")
+                return fallback
+            
+            logging.info(f"[REFINER] Successfully refined {len(refined_translations)} segments")
+            return refined_translations
+            
+        except json.JSONDecodeError as e:
+            logging.warning(f"[REFINER] JSON parse error: {e}")
+            return fallback
+        except Exception as e:
+            logging.warning(f"[REFINER] Parse error: {e}")
+            return fallback
+
+
+class TerminologyTracker:
+    """
+    🎯 Tracker pentru consistență terminologică globală
+    Ține evidența termenilor traduși pentru a asigura uniformitate
+    """
+    
+    def __init__(self):
+        self.term_map: Dict[str, str] = {}  # original -> traducere preferată
+        self.frequency: Dict[str, int] = {}  # câte ori apare fiecare termen
+    
+    def add_term(self, original: str, translation: str):
+        """Adaugă un termen în dicționar"""
+        original_lower = original.lower().strip()
+        if original_lower and translation.strip():
+            if original_lower in self.term_map:
+                self.frequency[original_lower] = self.frequency.get(original_lower, 0) + 1
+            else:
+                self.term_map[original_lower] = translation
+                self.frequency[original_lower] = 1
+    
+    def get_preferred_translation(self, original: str) -> str | None:
+        """Returnează traducerea preferată pentru un termen"""
+        return self.term_map.get(original.lower().strip())
+    
+    def get_summary(self) -> str:
+        """Returnează un rezumat al termenilor identificați"""
+        if not self.term_map:
+            return ""
+        
+        # Sortăm după frecvență
+        sorted_terms = sorted(
+            self.term_map.items(),
+            key=lambda x: self.frequency.get(x[0], 0),
+            reverse=True
+        )[:20]  # Top 20 termeni
+        
+        return "; ".join([f"{orig}→{trans}" for orig, trans in sorted_terms])
+
+
 class SubtitleGenerator:
     """
-    Flux complet de subtitrare:
-    1) Transcriere + Aliniere cu WhisperX (RTX 5090 optimized).
-    2) Traducere segment-cu-segment (Ollama + fallback Google).
-    3) Optimizare segmente.
-    4) Scriere SRT / Burn Video.
+    Flux complet optimizat cu post-procesare inteligentă:
+    1) Transcriere + Aliniere (WhisperX)
+    2) Traducere inițială segment-cu-segment
+    3) 🆕 POST-PROCESARE ÎN BATCH-URI pentru coerență
+    4) Optimizare segmente (CPS, durată, gap)
+    5) Generare SRT / Burn video
     """
 
     def __init__(
@@ -144,34 +350,35 @@ class SubtitleGenerator:
         self._ollama_models = [
             os.getenv("OLLAMA_MODEL_PRIMARY", "aya-translator-ro:latest"),
         ]
+        
+        # 🆕 Componente noi
+        self._refiner = BatchTranslationRefiner(
+            ollama_host=self._ollama_host,
+            ollama_model=self._ollama_models[0]
+        )
+        self._terminology_tracker = TerminologyTracker()
 
     # ------------ Internals ------------
 
     def _load_model(self):
-        """
-        Încarcă modelul de bază WhisperX (folosind faster-whisper backend).
-        """
+        """Încarcă WhisperX (RTX 5090 optimized)"""
         if self._model is not None:
             return self._model
         
-        # Configuratie RTX 5090: float16 pentru precizie maximă
         logging.info("[SUBTITLE] Loading WhisperX Model (Large-v3, Float16)...")
         self._model = whisperx.load_model(
             self.whisper_model_name, 
             device="cuda", 
             compute_type="float16",
-            language="ro" # Forțăm româna pentru un mic boost
+            language="ro"
         )
         return self._model
 
     def _transcribe(self, filepath: str):
-        """
-        Flux WhisperX: Transcriere -> Aliniere -> Returnare segmente curate
-        """
+        """WhisperX: Transcriere -> Aliniere"""
         device = "cuda"
-        batch_size = 16 # RTX 5090 duce lejer batch 16/32
+        batch_size = 16
         
-        # 1. Transcriere
         model = self._load_model()
         audio = whisperx.load_audio(filepath)
         
@@ -181,17 +388,14 @@ class SubtitleGenerator:
         detected_lang = result["language"]
         logging.info(f"[WhisperX] Detected language: {detected_lang}")
 
-        # 2. Aliniere (Corectarea timpilor)
-        logging.info("[WhisperX] 2/2: Aligning timestamps (Precision Step)...")
+        logging.info("[WhisperX] 2/2: Aligning timestamps...")
         
         try:
-            # Încarcă modelul de aliniere (mic, se descarcă automat de pe HF)
-            # NOTĂ: Aici apărea eroarea de torch, dar patch-ul de sus o rezolvă.
-            model_a, metadata = whisperx.load_align_model(
-                language_code=detected_lang, 
-                device=device
-            )
-            
+            with safe_globals([ListConfig]):
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=detected_lang,
+                    device=device,
+                )            
             aligned_result = whisperx.align(
                 result["segments"], 
                 model_a, 
@@ -201,7 +405,6 @@ class SubtitleGenerator:
                 return_char_alignments=False
             )
             
-            # Curățăm memoria modelului de aliniere
             del model_a
             gc.collect()
             torch.cuda.empty_cache()
@@ -212,7 +415,6 @@ class SubtitleGenerator:
             logging.warning(f"[WhisperX] Alignment failed ({e}). Using raw transcription.")
             final_segments = result["segments"]
 
-        # Convertim la format standard simplificat
         clean_segments = []
         for seg in final_segments:
             clean_segments.append({
@@ -220,18 +422,469 @@ class SubtitleGenerator:
                 "end": float(seg["end"]),
                 "text": seg["text"].strip()
             })
-
+        
         return clean_segments, detected_lang
 
-    # ... Restul metodelor (_translate_ollama, _write_srt, _burn_subtitles, etc.)
-    # rămân IDENTICE cu versiunea anterioară. 
-    # Asigură-te doar că _write_srt folosește textwrap cum am discutat.
+    def _shorten_translation(self, text: str) -> str:
+        """Scurtează text la max 84 caractere"""
+        fillers = {"foarte", "destul", "cam", "mai", "absolut", "total", "complet"}
+        words = text.split()
+        filtered = [w for w in words if w.lower() not in fillers]
+        candidate = " ".join(filtered) or text
 
-    # ----- COPIAZĂ AICI RESTUL METODELOR DIN CODUL TĂU VECHI -----
-    # _shorten_translation, _translate_ollama, _translate_segments, 
-    # _write_srt, _burn_subtitles, _probe_duration, _estimate_timeline, 
-    # _run_stage și generate
-    
-    # Doar un mic reminder pentru metoda generate:
-    # NU UITA să decomentezi optimizarea:
-    # segments, translated_texts = SubtitleQualityOptimizer.optimize_segments(segments, translated_texts)
+        if len(candidate) > 84:
+            return candidate[:81] + "..."
+        return candidate
+
+    def _translate_ollama(
+        self,
+        text: str,
+        target_lang: str,
+        prev_context: str = "",
+        next_context: str = "",
+        speaker: str | None = None,
+    ) -> str:
+        """Traducere cu context (segment individual)"""
+        system_prompt = (
+            f"You are an expert subtitle translator for {target_lang}.\n"
+            "Rules:\n"
+            "1. Natural, conversational language\n"
+            "2. Concise (readable in 1-2 seconds)\n"
+            "3. Context-aware\n"
+            "4. Max 42 chars/line, 2 lines max\n"
+            "5. Output ONLY the translation, nothing else\n"
+            "6. If noise/silence, return empty string"
+        )
+
+        speaker_info = f"Speaker: {speaker}\n" if speaker else ""
+        user_prompt = (
+            f"{speaker_info}"
+            f"Previous: \"{prev_context}\"\n"
+            f"Next: \"{next_context}\"\n"
+            f"Current: \"{text}\"\n"
+            f"Translation ({target_lang}):"
+        )
+
+        for mdl in self._ollama_models:
+            try:
+                resp = requests.post(
+                    f"{self._ollama_host}/v1/completions",
+                    json={
+                        "model": mdl,
+                        "prompt": f"{system_prompt}\n\n{user_prompt}",
+                        "options": {
+                            "temperature": 0.3,
+                            "top_p": 0.95,
+                            "top_k": 40,
+                            "repeat_penalty": 1.1,
+                            "max_tokens": 80,
+                            "stop": ["\n\n", "Previous:", "Current:", "Translation:"],
+                        },
+                        "stream": False,
+                    },
+                    timeout=60,
+                )
+                if not resp.ok:
+                    continue
+
+                data = resp.json()
+                txt = (data.get("choices") or [{}])[0].get("text", "") or ""
+                txt = txt.strip().strip('"').strip("'")
+                txt = " ".join(txt.split())
+
+                if not txt:
+                    continue
+
+                if len(txt) > 84:
+                    txt = self._shorten_translation(txt)
+
+                return txt
+            except Exception as e:
+                logging.warning(f"[SUBTITLE] Ollama model {mdl} error: {e}")
+
+        return ""
+
+    def _translate_segments(
+        self, segments: List[dict], target_lang: str, mode: str = "cloud"
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Traducere INIȚIALĂ segment-cu-segment
+        (va fi rafinată după cu batch processing)
+        """
+        translator_fallback = GoogleTranslator(source="auto", target=target_lang)
+
+        translated: List[str] = []
+        originals: List[str] = []
+
+        for i, seg in enumerate(segments):
+            orig = (seg.get("text") or "").strip()
+            originals.append(orig)
+
+            if not orig:
+                translated.append("")
+                continue
+
+            prev_tr = translated[i - 1] if i > 0 else ""
+            next_orig = (
+                (segments[i + 1].get("text") or "").strip()
+                if i < len(segments) - 1
+                else ""
+            )
+            speaker = seg.get("speaker")
+
+            result_text = ""
+
+            # Ollama (dacă nu e cloud)
+            if mode != "cloud":
+                try:
+                    result_text = self._translate_ollama(
+                        orig,
+                        target_lang,
+                        prev_context=prev_tr,
+                        next_context=next_orig,
+                        speaker=speaker,
+                    )
+                except Exception as e:
+                    logging.warning(f"[SUBTITLE] Ollama translate failed: {e}")
+
+            # Fallback Google
+            if not result_text:
+                try:
+                    result_text = translator_fallback.translate(orig)
+                except Exception as e:
+                    logging.warning(f"[SUBTITLE] Google translate failed: {e}")
+                    result_text = orig
+
+            translated.append(result_text)
+            
+            # Track terminology
+            if result_text and orig:
+                self._terminology_tracker.add_term(orig, result_text)
+
+        return translated, originals
+
+    def _refine_translations_in_batches(
+        self,
+        segments: List[dict],
+        translations: List[str],
+        originals: List[str],
+        target_lang: str,
+        mode: str = "local"
+    ) -> List[str]:
+        """
+        🆕 POST-PROCESARE: Rafinează traducerile în batch-uri pentru coerență
+        
+        Procesează câte BATCH_SIZE segmente odată pentru:
+        - Consistență terminologică
+        - Flow natural între segmente
+        - Corectare traduceri ciudate
+        """
+        if mode == "cloud":
+            # Skip refinement pentru modul cloud (Google-only)
+            logging.info("[REFINER] Skipping refinement in cloud mode")
+            return translations
+        
+        if not translations:
+            return translations
+        
+        logging.info(f"[REFINER] Starting batch refinement for {len(translations)} segments...")
+        
+        refined_translations = []
+        batch_size = self._refiner.BATCH_SIZE
+        
+        # Context global pentru LLM
+        global_context = self._terminology_tracker.get_summary()
+        
+        # Procesăm în batch-uri
+        for batch_start in range(0, len(segments), batch_size):
+            batch_end = min(batch_start + batch_size, len(segments))
+            
+            batch_segments = segments[batch_start:batch_end]
+            batch_translations = translations[batch_start:batch_end]
+            batch_originals = originals[batch_start:batch_end]
+            
+            logging.info(f"[REFINER] Processing batch {batch_start//batch_size + 1}/{(len(segments)-1)//batch_size + 1}")
+            
+            # Rafinăm batch-ul
+            refined_batch = self._refiner.refine_batch(
+                batch_segments=batch_segments,
+                batch_translations=batch_translations,
+                batch_originals=batch_originals,
+                target_lang=target_lang,
+                global_context=global_context
+            )
+            
+            refined_translations.extend(refined_batch)
+        
+        logging.info(f"[REFINER] Refinement complete: {len(refined_translations)} segments processed")
+        return refined_translations
+
+    def _write_srt(self, segments: List[dict], texts: List[str], srt_path: Path):
+        """Generare fișier SRT"""
+        subs = pysubs2.SSAFile()
+
+        for seg, txt in zip(segments, texts):
+            clean_txt = " ".join((txt or "").split())
+            wrapped = textwrap.wrap(clean_txt, width=40)
+            formatted_text = "\\N".join(wrapped[:2])
+
+            start_ms = int(float(seg.get("start", 0)) * 1000)
+            end_ms = int(float(seg.get("end", 0)) * 1000)
+
+            if end_ms - start_ms < 800:
+                end_ms = start_ms + 800
+
+            event = pysubs2.SSAEvent(start=start_ms, end=end_ms, text=formatted_text)
+            subs.append(event)
+
+        subs.save(str(srt_path), encoding="utf-8")
+
+    def _burn_subtitles(self, video_path: Path, srt_path: Path, output_path: Path):
+        """Arde subtitles în video"""
+        srt_escaped = srt_path.as_posix().replace("'", r"\\'")
+
+        (
+            ffmpeg
+            .input(str(video_path))
+            .output(
+                str(output_path),
+                vf=f"subtitles='{srt_escaped}'",
+                acodec="copy",
+                vcodec="libx264",
+                preset="fast",
+                crf=18,
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+    def _probe_duration(self, video_path: Path) -> float:
+        """Obține durata video"""
+        try:
+            meta = ffmpeg.probe(str(video_path))
+            for stream in meta.get("streams", []):
+                if stream.get("codec_type") == "video" and stream.get("duration"):
+                    return float(stream["duration"])
+            if "format" in meta and meta["format"].get("duration"):
+                return float(meta["format"]["duration"])
+        except Exception as e:
+            logging.warning(f"Nu pot obține durata video: {e}")
+        return 0.0
+
+    def _estimate_timeline(self, duration: float, attach_mode: str):
+        """Estimare timeline cu REFINEMENT step"""
+        rt_factor = float(os.getenv("SUBTITLE_RT_FACTOR", "1.2"))
+        translate_factor = float(os.getenv("SUBTITLE_TRANSLATE_FACTOR", "0.25"))
+        refine_factor = float(os.getenv("SUBTITLE_REFINE_FACTOR", "0.15"))  # 🆕 NOU
+        burn_factor = float(os.getenv("SUBTITLE_BURN_FACTOR", "0.5"))
+        summary_factor = float(os.getenv("SUBTITLE_SUMMARY_FACTOR", "0.15"))
+
+        duration = max(duration, 60.0)
+
+        est_transcribe = duration * rt_factor
+        est_translate = duration * translate_factor
+        est_refine = duration * refine_factor  # 🆕 NOU
+        est_burn = duration * burn_factor if attach_mode == "hard" else 0.0
+        est_summary = duration * summary_factor
+        est_overhead = 8.0
+
+        total = est_transcribe + est_translate + est_refine + est_burn + est_summary + est_overhead
+        return {
+            "transcribe": est_transcribe,
+            "translate": est_translate,
+            "refine": est_refine,  # 🆕 NOU
+            "burn": est_burn,
+            "summary": est_summary,
+            "overhead": est_overhead,
+            "total": total,
+        }
+
+    def _run_stage(
+        self,
+        label: str,
+        expected_seconds: float,
+        base_percent: float,
+        weight_percent: float,
+        func,
+    ):
+        """Execută un stage cu progress tracking"""
+        start = time.time()
+        done = threading.Event()
+
+        def ticker():
+            while not done.is_set():
+                elapsed = time.time() - start
+                ratio = min(1.0, elapsed / max(expected_seconds, 0.1))
+                percent = base_percent + ratio * weight_percent
+                eta = max(
+                    0.0,
+                    (self._total_expected or expected_seconds)
+                    - (time.time() - self._global_start),
+                )
+                send_task_progress(
+                    percent=percent, eta_seconds=eta, stage=label, detail="în curs"
+                )
+                time.sleep(1.0)
+
+        t = threading.Thread(target=ticker, daemon=True)
+        t.start()
+        try:
+            result = func()
+        finally:
+            done.set()
+            t.join(timeout=0.2)
+
+        percent = base_percent + weight_percent
+        eta = max(
+            0.0,
+            (self._total_expected or expected_seconds)
+            - (time.time() - self._global_start),
+        )
+        send_task_progress(
+            percent=percent, eta_seconds=eta, stage=label, detail="finalizat"
+        )
+        return result
+
+    # ------------ API publică ------------
+
+    def generate(
+        self,
+        filepath: str,
+        lang: str = "ro",
+        attach_mode: str = "soft",
+        detail_level: str = "medium",
+        translator_mode: str = "local",
+    ):
+        """
+        Generează subtitrare cu POST-PROCESARE INTELIGENTĂ
+        
+        Flux:
+        1. Transcriere (WhisperX)
+        2. Traducere inițială segment-cu-segment
+        3. 🆕 Rafinare în batch-uri pentru coerență
+        4. Optimizare segmente (CPS, gap, durată)
+        5. SRT + video (opțional)
+        """
+        video_path = Path(filepath)
+        attach_mode = (attach_mode or "soft").lower()
+        translator_mode = (translator_mode or "cloud").lower()
+        
+        print(f"[SUBTITLE] Mode: attach={attach_mode}, translator={translator_mode}")
+        self._global_start = time.time()
+
+        duration = self._probe_duration(video_path)
+        timeline = self._estimate_timeline(duration, attach_mode)
+        self._total_expected = timeline["total"]
+
+        # Procente ajustate pentru noul step de refinement
+        pct_transcribe = 50.0
+        pct_translate = 20.0
+        pct_refine = 12.0  # 🆕 NOU
+        pct_summary = 8.0
+        pct_burn = 0.0 if attach_mode != "hard" else 7.0
+        pct_finalize = 100.0 - (pct_transcribe + pct_translate + pct_refine + pct_summary + pct_burn)
+
+        send_task_progress(percent=1.0, eta_seconds=timeline["total"], stage="init", detail="pregătire")
+
+        # 1) TRANSCRIERE
+        print(f"[SUBTITLE] Transcriere: {video_path.name}")
+        segments, detected_lang = self._run_stage(
+            "transcriere",
+            expected_seconds=timeline["transcribe"],
+            base_percent=0.0,
+            weight_percent=pct_transcribe,
+            func=lambda: self._transcribe(str(video_path)),
+        )
+        print(f"[SUBTITLE] Transcriere OK: {len(segments)} segmente, limbă={detected_lang}")
+
+        # 2) TRADUCERE INIȚIALĂ
+        print("[SUBTITLE] Traducere inițială...")
+        translated_texts, originals = self._run_stage(
+            "traducere",
+            expected_seconds=timeline["translate"],
+            base_percent=pct_transcribe,
+            weight_percent=pct_translate,
+            func=lambda: self._translate_segments(
+                segments, target_lang=lang, mode=translator_mode
+            ),
+        )
+        print(f"[SUBTITLE] Traducere inițială OK: {len(translated_texts)} segmente")
+
+        # 3) 🆕 POST-PROCESARE ÎN BATCH-URI
+        print("[SUBTITLE] Rafinare batch pentru coerență...")
+        refined_translations = self._run_stage(
+            "rafinare",
+            expected_seconds=timeline["refine"],
+            base_percent=pct_transcribe + pct_translate,
+            weight_percent=pct_refine,
+            func=lambda: self._refine_translations_in_batches(
+                segments, translated_texts, originals, target_lang=lang, mode=translator_mode
+            ),
+        )
+        print(f"[SUBTITLE] Rafinare OK: {len(refined_translations)} segmente")
+
+        # 4) OPTIMIZARE SEGMENTE
+        segments, refined_translations = SubtitleQualityOptimizer.optimize_segments(
+            segments, refined_translations
+        )
+
+        # 5) SCRIERE SRT
+        srt_path = self.processed_dir / f"{video_path.stem}_{lang}.srt"
+        self._write_srt(segments, refined_translations, srt_path)
+        send_task_progress(
+            percent=pct_transcribe + pct_translate + pct_refine,
+            eta_seconds=max(0.0, timeline["total"] - (time.time() - self._global_start)),
+            stage="srt",
+            detail="fișier SRT generat",
+        )
+
+        # 6) REZUMAT VIDEO
+        full_text = "\n".join(refined_translations)
+        print("[SUBTITLE] Rezumat video...")
+        summary_result = self._run_stage(
+            "rezumat",
+            expected_seconds=timeline.get("summary", max(8.0, duration * 0.1)),
+            base_percent=pct_transcribe + pct_translate + pct_refine,
+            weight_percent=pct_summary,
+            func=lambda: self._summary_service.summarize_content(
+                content_id=video_path.stem,
+                text=full_text,
+                metadata={
+                    "source_type": "video",
+                    "lang": lang,
+                    "detail": detail_level,
+                },
+            ),
+        )
+
+        response = {
+            "attach_mode": attach_mode,
+            "subtitle_file": f"/download/{srt_path.name}",
+            "subtitle_language": lang,
+            "detected_language": detected_lang,
+            "segments": len(segments),
+            "note": "Subtitrare cu WhisperX + Batch Refinement pentru coerență maximă",
+            "summary": summary_result.get("summary"),
+            "summary_file": f"/download/{summary_result.get('summary_file')}"
+            if summary_result.get("summary_file")
+            else None,
+            "terminology_tracked": len(self._terminology_tracker.term_map),  # 🆕 Statistică
+        }
+
+        # 7) HARD ATTACH (burn)
+        if attach_mode == "hard":
+            output_video = self.processed_dir / f"{video_path.stem}_{lang}_subtitled.mp4"
+            self._run_stage(
+                "burn",
+                expected_seconds=timeline["burn"],
+                base_percent=pct_transcribe + pct_translate + pct_refine + pct_summary,
+                weight_percent=pct_burn,
+                func=lambda: self._burn_subtitles(video_path, srt_path, output_video),
+            )
+            response["video_file"] = f"/download/{output_video.name}"
+        else:
+            response["video_file"] = f"/download/{srt_path.name}"
+
+        send_task_progress(percent=100.0, eta_seconds=0.0, stage="gata", detail="complet")
+        print(f"[SUBTITLE] ✅ FINALIZAT: SRT={srt_path.name}, Video={response.get('video_file')}")
+        return response
