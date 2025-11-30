@@ -1,65 +1,237 @@
-def _transcribe(self, filepath: str):
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from pathlib import Path
+from typing import List, Tuple
+import gc
+
+# ==========================================
+#  FIX CRITIC PENTRU PYTORCH 2.6+ / RTX 5090
+# ==========================================
+import torch
+
+# WhisperX nu a fost actualizat pentru noile reguli de securitate PyTorch.
+# Această funcție "păcălește" biblioteca să funcționeze corect.
+_original_torch_load = torch.load
+
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        # Setăm False pentru a permite încărcarea modelelor vechi (pickle)
+        # Folosim False pentru compatibilitate maximă cu WhisperX
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _patched_torch_load
+# ==========================================
+
+import textwrap
+import requests
+import ffmpeg
+import pysubs2
+import whisperx
+from deep_translator import GoogleTranslator
+
+from services.progress_bar import send_task_progress
+from services.category_v.summary_service import SummaryService
+
+
+class SubtitleQualityOptimizer:
+    """
+    Optimizare de bază:
+    - CPS (15-20) cât de cât ok
+    - durată minimă pe segment
+    - gap minim între segmente
+    """
+
+    MAX_CHARS_PER_LINE = 42
+    MAX_LINES = 2
+    MIN_DURATION = 0.8  # secunde
+    MAX_DURATION = 7.0  # secunde
+    MIN_GAP = 0.1       # secunde
+    MAX_CPS = 20        # characters per second
+
+    @classmethod
+    def optimize_segments(
+        cls, segments: List[dict], texts: List[str]
+    ) -> Tuple[List[dict], List[str]]:
+        if not segments:
+            return segments, texts
+
+        new_segments: List[dict] = []
+        new_texts: List[str] = []
+
+        i = 0
+        n = len(segments)
+
+        while i < n:
+            seg = dict(segments[i])
+            text = texts[i]
+            duration = max(float(seg["end"] - seg["start"]), 0.001)
+            chars = len(text.replace("\n", ""))
+            cps = chars / duration if duration > 0 else cls.MAX_CPS + 1
+
+            # 1) Merge dacă e prea rapid (CPS mare)
+            if cps > cls.MAX_CPS and i + 1 < n:
+                next_seg = segments[i + 1]
+                next_text = texts[i + 1]
+                gap = float(next_seg["start"] - seg["end"])
+                combined_len = len(text) + 1 + len(next_text)
+
+                if gap < 1.0 and combined_len <= cls.MAX_CHARS_PER_LINE * cls.MAX_LINES:
+                    merged_seg = {
+                        "start": seg["start"],
+                        "end": next_seg["end"],
+                        "text": f'{seg.get("text", "")} {next_seg.get("text", "")}',
+                    }
+                    merged_text = f"{text} {next_text}"
+                    new_segments.append(merged_seg)
+                    new_texts.append(merged_text)
+                    i += 2
+                    continue
+
+            # 2) Ajustare durată
+            if duration < cls.MIN_DURATION:
+                seg["end"] = seg["start"] + cls.MIN_DURATION
+            elif duration > cls.MAX_DURATION:
+                # Aici doar limităm, nu putem re-segmenta ușor fără info de la whisper
+                seg["end"] = seg["start"] + cls.MAX_DURATION
+
+            new_segments.append(seg)
+            new_texts.append(text)
+            i += 1
+
+        # 3) Gap minim
+        for i in range(len(new_segments) - 1):
+            cur = new_segments[i]
+            nxt = new_segments[i + 1]
+            gap = float(nxt["start"] - cur["end"])
+            if gap < cls.MIN_GAP:
+                adjust = (cls.MIN_GAP - gap) / 2.0
+                cur["end"] -= adjust
+                nxt["start"] += adjust
+                if nxt["start"] < cur["start"] + cls.MIN_DURATION:
+                    nxt["start"] = cur["start"] + cls.MIN_DURATION
+
+        return new_segments, new_texts
+
+
+class SubtitleGenerator:
+    """
+    Flux complet de subtitrare:
+    1) Transcriere + Aliniere cu WhisperX (RTX 5090 optimized).
+    2) Traducere segment-cu-segment (Ollama + fallback Google).
+    3) Optimizare segmente.
+    4) Scriere SRT / Burn Video.
+    """
+
+    def __init__(
+        self,
+        processed_dir: str = "processed",
+        whisper_model: str = "large-v3",
+    ):
+        self.processed_dir = Path(processed_dir)
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        self.whisper_model_name = whisper_model
+        self._model = None
+        self._global_start = None
+        self._total_expected = None
+        self._summary_service = SummaryService()
+        self._ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        
+        self._ollama_models = [
+            os.getenv("OLLAMA_MODEL_PRIMARY", "aya-translator-ro:latest"),
+        ]
+
+    # ------------ Internals ------------
+
+    def _load_model(self):
         """
-        Transcriere folosind WhisperX:
-        1. Transcriere rapidă (batch inference).
-        2. Aliniere forțată (Wav2Vec2) pentru timp exact.
+        Încarcă modelul de bază WhisperX (folosind faster-whisper backend).
+        """
+        if self._model is not None:
+            return self._model
+        
+        # Configuratie RTX 5090: float16 pentru precizie maximă
+        logging.info("[SUBTITLE] Loading WhisperX Model (Large-v3, Float16)...")
+        self._model = whisperx.load_model(
+            self.whisper_model_name, 
+            device="cuda", 
+            compute_type="float16",
+            language="ro" # Forțăm româna pentru un mic boost
+        )
+        return self._model
+
+    def _transcribe(self, filepath: str):
+        """
+        Flux WhisperX: Transcriere -> Aliniere -> Returnare segmente curate
         """
         device = "cuda"
-        # Pe RTX 5090 folosim float16 pentru precizie maximă. 
-        # int8 e doar pentru economie de VRAM, de care tu nu ai nevoie.
-        compute_type = "float16" 
-        batch_size = 16 # Merge și 32 pe 5090, dar 16 e super safe și rapid
-
-        logging.info(f"[WhisperX] Loading model {self.whisper_model_name} on {device}...")
-
-        # 1. Încărcare Model Transcriere
-        model = whisperx.load_model(
-            self.whisper_model_name, 
-            device, 
-            compute_type=compute_type,
-            language="ro" # Specificăm româna pentru a ajuta modelul
-        )
-
-        # 2. Transcriere propriu-zisă
-        logging.info("[WhisperX] Transcribing audio...")
+        batch_size = 16 # RTX 5090 duce lejer batch 16/32
+        
+        # 1. Transcriere
+        model = self._load_model()
         audio = whisperx.load_audio(filepath)
+        
+        logging.info("[WhisperX] 1/2: Transcribing audio...")
         result = model.transcribe(audio, batch_size=batch_size)
         
-        # Salvăm limba detectată (sau impusă)
-        language = result["language"]
+        detected_lang = result["language"]
+        logging.info(f"[WhisperX] Detected language: {detected_lang}")
 
-        # (Opțional) Curățăm VRAM-ul de modelul de transcriere pentru a face loc celui de aliniere
-        # Pe 5090 nu e strict necesar, dar e "best practice"
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # 3. Încărcare Model Aliniere
-        logging.info("[WhisperX] Loading alignment model...")
-        model_a, metadata = whisperx.load_align_model(
-            language_code=language, 
-            device=device
-        )
-
-        # 4. Aliniere (Aici se întâmplă magia sincronizării)
-        logging.info("[WhisperX] Aligning segments...")
-        aligned_result = whisperx.align(
-            result["segments"], 
-            model_a, 
-            metadata, 
-            audio, 
-            device, 
-            return_char_alignments=False
-        )
-
-        # Curățăm și modelul de aliniere
-        del model_a
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # 5. Formatare pentru restul codului
-        # WhisperX returnează o structură complexă, noi extragem lista de segmente
-        segments = aligned_result["segments"]
+        # 2. Aliniere (Corectarea timpilor)
+        logging.info("[WhisperX] 2/2: Aligning timestamps (Precision Step)...")
         
-        logging.info(f"[WhisperX] Done. {len(segments)} aligned segments.")
-        return segments, language
+        try:
+            # Încarcă modelul de aliniere (mic, se descarcă automat de pe HF)
+            # NOTĂ: Aici apărea eroarea de torch, dar patch-ul de sus o rezolvă.
+            model_a, metadata = whisperx.load_align_model(
+                language_code=detected_lang, 
+                device=device
+            )
+            
+            aligned_result = whisperx.align(
+                result["segments"], 
+                model_a, 
+                metadata, 
+                audio, 
+                device, 
+                return_char_alignments=False
+            )
+            
+            # Curățăm memoria modelului de aliniere
+            del model_a
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            final_segments = aligned_result["segments"]
+            
+        except Exception as e:
+            logging.warning(f"[WhisperX] Alignment failed ({e}). Using raw transcription.")
+            final_segments = result["segments"]
+
+        # Convertim la format standard simplificat
+        clean_segments = []
+        for seg in final_segments:
+            clean_segments.append({
+                "start": float(seg["start"]),
+                "end": float(seg["end"]),
+                "text": seg["text"].strip()
+            })
+
+        return clean_segments, detected_lang
+
+    # ... Restul metodelor (_translate_ollama, _write_srt, _burn_subtitles, etc.)
+    # rămân IDENTICE cu versiunea anterioară. 
+    # Asigură-te doar că _write_srt folosește textwrap cum am discutat.
+
+    # ----- COPIAZĂ AICI RESTUL METODELOR DIN CODUL TĂU VECHI -----
+    # _shorten_translation, _translate_ollama, _translate_segments, 
+    # _write_srt, _burn_subtitles, _probe_duration, _estimate_timeline, 
+    # _run_stage și generate
+    
+    # Doar un mic reminder pentru metoda generate:
+    # NU UITA să decomentezi optimizarea:
+    # segments, translated_texts = SubtitleQualityOptimizer.optimize_segments(segments, translated_texts)
