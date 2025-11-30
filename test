@@ -1,529 +1,591 @@
-import re
-import torch
-import uvicorn
+from __future__ import annotations
+
 import logging
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from enum import Enum
-from typing import Optional
+import os
+import threading
+import time
+from pathlib import Path
+from typing import List, Tuple
 
-# --- CONFIGURARE LOGGING ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import textwrap
+import requests
+import ffmpeg
+import pysubs2
+import whisper
+from deep_translator import GoogleTranslator
 
-# --- CONFIGURARE MODEL ---
-MODEL_ID = "haoranxu/X-ALMA-13B-Group2"
-HOST = "0.0.0.0"
-PORT = 8001
+from services.progress_bar import send_task_progress
+from services.category_v.summary_service import SummaryService
 
-app = FastAPI(
-    title="X-ALMA Translation API (Multi-Strategy)",
-    version="6.0",
-    description="API de traducere inteligent cu detecție automată de strategie"
-)
 
-model = None
-tokenizer = None
+class SubtitleQualityOptimizer:
+    """
+    Optimizare de bază:
+    - CPS (15-20) cât de cât ok
+    - durată minimă pe segment
+    - gap minim între segmente
+    """
 
-# --- MAPARE GRUPURI LIMBI X-ALMA ---
-LANGUAGE_GROUPS = {
-    # Group 1: Germanic + Slavic core
-    "German": 1, "Czech": 1, "Icelandic": 1, "Russian": 1,
-    
-    # Group 2: Romance languages (MODELUL NOSTRU)
-    "Romanian": 2, "Catalan": 2, "Galician": 2, 
-    "Italian": 2, "Portuguese": 2, "Spanish": 2,
-    
-    # Group 3: More Slavic + Baltic
-    "Ukrainian": 3, "Belarusian": 3, "Bulgarian": 3,
-    "Macedonian": 3, "Lithuanian": 3, "Latvian": 3,
-    
-    # Group 4: More Germanic + Nordic
-    "Dutch": 4, "Danish": 4, "Swedish": 4, "Norwegian": 4,
-    
-    # Group 5: Indo-Aryan + Persian
-    "Hindi": 5, "Bengali": 5, "Marathi": 5, "Nepali": 5, "Farsi": 5,
-    
-    # Group 6: East Asian + Finno-Ugric
-    "Chinese": 6, "Japanese": 6, "Korean": 6,
-    "Finnish": 6, "Estonian": 6, "Georgian": 6,
-    
-    # English: Universal pivot
-    "English": 0  # Group 0 = pivot language
-}
+    MAX_CHARS_PER_LINE = 42
+    MAX_LINES = 2
+    MIN_DURATION = 0.8  # secunde
+    MAX_DURATION = 7.0  # secunde (deja ajutat de stable-ts)
+    MIN_GAP = 0.1       # secunde
+    MAX_CPS = 20        # characters per second
 
-class TranslationStrategy(str, Enum):
-    """Strategii de traducere disponibile"""
-    DIRECT = "direct"  # Traducere directă (pentru limbi din același grup sau cu EN)
-    PIVOT = "pivot"    # Traducere prin pivot EN (pentru grupuri diferite)
-    AUTO = "auto"      # Detecție automată
+    @classmethod
+    def optimize_segments(
+        cls, segments: List[dict], texts: List[str]
+    ) -> Tuple[List[dict], List[str]]:
+        if not segments:
+            return segments, texts
 
-# --- PATTERN-URI PENTRU CURĂȚARE ---
-CLEANUP_PATTERNS = [
-    # Ghilimele și apostrof
-    (r'^["\'](.+)["\']$', r'\1'),
-    (r'^"(.+)"$', r'\1'),
-    (r"^'(.+)'$", r'\1'),
-    
-    # Prefixe comune în răspunsuri (case insensitive)
-    (r'^(?:Traducere|Translation|Răspuns|Raspuns|Answer|Result|Output)\s*:\s*', '', re.IGNORECASE),
-    (r'^(?:În|In)\s+(?:limba\s+)?(?:română|romana|română|english)\s*:\s*', '', re.IGNORECASE),
-    (r'^(?:Here is the translation|Iată traducerea)\s*:\s*', '', re.IGNORECASE),
-    
-    # Explicații între paranteze la final
-    (r'\s*\([^)]*explanation[^)]*\)\s*$', '', re.IGNORECASE),
-    (r'\s*\([^)]*note[^)]*\)\s*$', '', re.IGNORECASE),
-    (r'\s*\([^)]*literal[^)]*\)\s*$', '', re.IGNORECASE),
-    
-    # Explicații după liniuță
-    (r'\s*[-–—]\s*(?:this means|meaning|i\.e\.|note|explanation).*$', '', re.IGNORECASE),
-    
-    # Notițe la final
-    (r'\n\s*(?:Note|Notă|N\.B\.|P\.S\.|FYI)\s*:.*$', '', re.IGNORECASE | re.MULTILINE),
-    (r'\n\s*\*\s*.*(?:literal|meaning|explanation).*$', '', re.IGNORECASE | re.MULTILINE),
-    
-    # Markdown și formatare
-    (r'^\*\*(.+)\*\*$', r'\1'),
-    (r'^`(.+)`$', r'\1'),
-    
-    # Spații multiple și newline-uri
-    (r'^\s+|\s+$', ''),
-    (r'\n{3,}', '\n\n'),
-]
+        new_segments: List[dict] = []
+        new_texts: List[str] = []
 
-def clean_translation_output(text: str) -> str:
-    """Curăță outputul de la model"""
-    if not text:
-        return text
-    
-    cleaned = text.strip()
-    
-    for pattern_data in CLEANUP_PATTERNS:
-        if len(pattern_data) == 2:
-            pattern, replacement = pattern_data
-            flags = 0
+        i = 0
+        n = len(segments)
+
+        while i < n:
+            seg = dict(segments[i])
+            text = texts[i]
+            duration = max(float(seg["end"] - seg["start"]), 0.001)
+            chars = len(text.replace("\n", ""))
+            cps = chars / duration if duration > 0 else cls.MAX_CPS + 1
+
+            # 1) Dacă e prea rapid, încearcă să unești cu următorul segment
+            if cps > cls.MAX_CPS and i + 1 < n:
+                next_seg = segments[i + 1]
+                next_text = texts[i + 1]
+                gap = float(next_seg["start"] - seg["end"])
+                combined_len = len(text) + 1 + len(next_text)
+
+                if gap < 1.0 and combined_len <= cls.MAX_CHARS_PER_LINE * cls.MAX_LINES:
+                    merged_seg = {
+                        "start": seg["start"],
+                        "end": next_seg["end"],
+                        "text": f'{seg.get("text", "")} {next_seg.get("text", "")}',
+                    }
+                    merged_text = f"{text} {next_text}"
+                    new_segments.append(merged_seg)
+                    new_texts.append(merged_text)
+                    i += 2
+                    continue
+
+            # 2) Ajustează durata minimă / maximă
+            if duration < cls.MIN_DURATION:
+                seg["end"] = seg["start"] + cls.MIN_DURATION
+            elif duration > cls.MAX_DURATION:
+                # lăsăm stable-ts să facă heavy lifting, aici doar clamp
+                seg["end"] = seg["start"] + cls.MAX_DURATION
+
+            new_segments.append(seg)
+            new_texts.append(text)
+            i += 1
+
+        # 3) Gap minim între segmente
+        for i in range(len(new_segments) - 1):
+            cur = new_segments[i]
+            nxt = new_segments[i + 1]
+            gap = float(nxt["start"] - cur["end"])
+            if gap < cls.MIN_GAP:
+                adjust = (cls.MIN_GAP - gap) / 2.0
+                cur["end"] -= adjust
+                nxt["start"] += adjust
+                # protecție: să nu inversăm segmentele
+                if nxt["start"] < cur["start"] + cls.MIN_DURATION:
+                    nxt["start"] = cur["start"] + cls.MIN_DURATION
+
+        return new_segments, new_texts
+
+
+class SubtitleGenerator:
+    """
+    Flux complet de subtitrare:
+    1) Transcriere video cu stable-ts (dacă există) / Whisper.
+    2) Traducere segment-cu-segment (Ollama + fallback Google).
+    3) Optimizare segmente (CPS + durată).
+    4) Scriere SRT în 'processed/'.
+    5) Dacă attach_mode == 'hard', arde subtitrarea în video cu ffmpeg.
+    """
+
+    def __init__(
+        self,
+        processed_dir: str = "processed",
+        whisper_model: str = "large-v3",
+    ):
+        self.processed_dir = Path(processed_dir)
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        self.whisper_model_name = whisper_model
+        self._model = None
+        self._global_start = None
+        self._total_expected = None
+        self._summary_service = SummaryService()
+        self._ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        # modele Ollama în ordinea preferinței
+        self._ollama_models = [
+            os.getenv("OLLAMA_MODEL_PRIMARY", "jobautomation/OpenEuroLLM-Romanian"),
+            os.getenv("OLLAMA_MODEL_SECONDARY", "qwen2.5:14b"),
+            os.getenv("OLLAMA_MODEL_TERTIARY", "mistral-nemo:latest"),
+        ]
+
+    # ------------ Internals ------------
+
+    def _load_model(self):
+        """
+        Încearcă stable-whisper; dacă nu e instalat sau pică, folosește whisper clasic.
+        """
+        if self._model is not None:
+            return self._model
+
+        try:
+            import stable_whisper  # type: ignore
+
+            self._model = stable_whisper.load_model(self.whisper_model_name)
+            logging.info("[SUBTITLE] Loaded stable-whisper model: %s", self.whisper_model_name)
+        except Exception as e:
+            logging.warning(
+                "[SUBTITLE] stable_whisper load failed (%s), fallback to whisper", e
+            )
+            self._model = whisper.load_model(self.whisper_model_name)
+
+        return self._model
+
+    def _transcribe(self, filepath: str):
+        """
+        Transcriere cu stable-ts (dacă e disponibil) pentru timestamp-uri mai bune.
+        """
+        model = self._load_model()
+
+        # Încercăm API-ul stable-whisper; dacă nu merge, fallback la whisper standard
+        try:
+            result = model.transcribe(filepath, vad=True)
+            # Funcții specifice stable-ts:
+            result = (
+                result
+                .clamp_max_duration(7.0)
+                .split_by_length(max_chars=42)
+                .split_by_gap(0.5)
+                .merge_by_gap(0.15)
+            )
+            data = result.to_dict()
+            segments = data.get("segments", [])
+            language = getattr(result, "language", None) or "auto"
+            return segments, language
+        except Exception:
+            logging.warning("[SUBTITLE] Falling back to vanilla whisper.transcribe()")
+            res = model.transcribe(filepath, task="transcribe", verbose=False)
+            segments = res.get("segments", [])
+            language = res.get("language", "auto")
+            return segments, language
+
+    # ----- Traducere Ollama -----
+
+    def _shorten_translation(self, text: str) -> str:
+        """
+        Scurtează textul la max ~84 caractere păstrând sensul cât de cât.
+        Simplu: scoatem filler words, apoi tăiem cu '...' dacă încă e prea lung.
+        """
+        fillers = {"foarte", "destul", "cam", "mai", "absolut", "total", "complet"}
+        words = text.split()
+        filtered = [w for w in words if w.lower() not in fillers]
+        candidate = " ".join(filtered) or text
+
+        if len(candidate) > 84:
+            return candidate[:81] + "..."
+        return candidate
+
+    def _translate_ollama(
+        self,
+        text: str,
+        target_lang: str,
+        prev_context: str = "",
+        next_context: str = "",
+        speaker: str | None = None,
+    ) -> str:
+        """
+        Traducere cu context extins (prev + next) și info simplă despre speaker.
+        """
+        system_prompt = (
+            f"You are an expert subtitle translator specializing in {target_lang}. "
+            "Your translations must be:\n"
+            "1. NATURAL and CONVERSATIONAL (real spoken language)\n"
+            "2. CONCISE - readable in 1-2 seconds\n"
+            "3. CONTEXTUALLY AWARE - keep continuity with previous and next lines\n"
+            "4. CULTURALLY ADAPTED\n"
+            "5. CONSISTENT in names and terminology\n\n"
+            "CRITICAL RULES:\n"
+            "- Output ONLY the translation, no explanations\n"
+            "- Shorten if needed to fit subtitle constraints (max 42 chars/line, 2 lines)\n"
+            "- Preserve the speaker's tone and emotion\n"
+            "- If the input is noise or silence, return an empty string"
+        )
+
+        speaker_context = f"Speaker: {speaker}\n" if speaker else ""
+
+        user_prompt = (
+            f"{speaker_context}"
+            f"Previous subtitle (translated): \"{prev_context}\"\n"
+            f"Next subtitle (original): \"{next_context}\"\n"
+            f"Current dialogue: \"{text}\"\n"
+            f"Translation ({target_lang}):"
+        )
+
+        for mdl in self._ollama_models:
+            try:
+                resp = requests.post(
+                    f"{self._ollama_host}/v1/completions",
+                    json={
+                        "model": mdl,
+                        "prompt": f"{system_prompt}\n\n{user_prompt}",
+                        "options": {
+                            "temperature": 0.3,
+                            "top_p": 0.95,
+                            "top_k": 40,
+                            "repeat_penalty": 1.1,
+                            "max_tokens": 80,
+                            "stop": ["\n\n", "Previous:", "Current:", "Translation:"],
+                        },
+                        "stream": False,
+                    },
+                    timeout=60,
+                )
+                if not resp.ok:
+                    continue
+
+                data = resp.json()
+                txt = (data.get("choices") or [{}])[0].get("text", "") or ""
+                txt = txt.strip().strip('"').strip("'")
+                txt = " ".join(txt.split())  # normalize spaces
+
+                if not txt:
+                    continue
+
+                if len(txt) > 84:
+                    txt = self._shorten_translation(txt)
+
+                return txt
+            except Exception as e:
+                logging.warning("[SUBTITLE] Ollama model %s error: %s", mdl, e)
+
+        return ""
+
+    # ----- Traducere segment cu segment -----
+
+    def _translate_segments(
+        self, segments: List[dict], target_lang: str, mode: str = "cloud"
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Returnează (texte_traduse, texte_originale).
+        - Mod 'cloud' => doar Google Translator.
+        - Alt mod => Ollama cu context + fallback Google.
+        """
+        translator_fallback = GoogleTranslator(source="auto", target=target_lang)
+
+        translated: List[str] = []
+        originals: List[str] = []
+
+        for i, seg in enumerate(segments):
+            orig = (seg.get("text") or "").strip()
+            originals.append(orig)
+
+            if not orig:
+                translated.append("")
+                continue
+
+            prev_tr = translated[i - 1] if i > 0 else ""
+            next_orig = (
+                (segments[i + 1].get("text") or "").strip()
+                if i < len(segments) - 1
+                else ""
+            )
+            speaker = seg.get("speaker")
+
+            result_text = ""
+
+            # 1) Ollama (dacă nu e cloud)
+            if mode != "cloud":
+                try:
+                    result_text = self._translate_ollama(
+                        orig,
+                        target_lang,
+                        prev_context=prev_tr,
+                        next_context=next_orig,
+                        speaker=speaker,
+                    )
+                except Exception as e:
+                    logging.warning("[SUBTITLE] Ollama translate failed: %s", e)
+
+            # 2) Fallback (sau mod 'cloud'): Google
+            if not result_text:
+                try:
+                    result_text = translator_fallback.translate(orig)
+                except Exception as e:
+                    logging.warning("[SUBTITLE] Google translate failed: %s", e)
+                    result_text = orig  # ultim fallback: text original
+
+            translated.append(result_text)
+
+        return translated, originals
+
+    # ----- SRT + burn -----
+
+    def _write_srt(self, segments: List[dict], texts: List[str], srt_path: Path):
+        subs = pysubs2.SSAFile()
+
+        for seg, txt in zip(segments, texts):
+            clean_txt = " ".join((txt or "").split())
+            # max 42 caractere/linie, max 2 linii
+            wrapped = textwrap.wrap(clean_txt, width=40)
+            formatted_text = "\\N".join(wrapped[:2])
+
+            start_ms = int(float(seg.get("start", 0)) * 1000)
+            end_ms = int(float(seg.get("end", 0)) * 1000)
+
+            # durată minimă 0.8s
+            if end_ms - start_ms < 800:
+                end_ms = start_ms + 800
+
+            event = pysubs2.SSAEvent(start=start_ms, end=end_ms, text=formatted_text)
+            subs.append(event)
+
+        subs.save(str(srt_path), encoding="utf-8")
+
+    def _burn_subtitles(self, video_path: Path, srt_path: Path, output_path: Path):
+        """
+        Arde SRT-ul în video folosind ffmpeg. Video-ul rezultat este salvat în processed/.
+        """
+        srt_escaped = srt_path.as_posix().replace("'", r"\\'")
+
+        (
+            ffmpeg
+            .input(str(video_path))
+            .output(
+                str(output_path),
+                vf=f"subtitles='{srt_escaped}'",
+                acodec="copy",
+                vcodec="libx264",
+                preset="fast",
+                crf=18,
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+    # ----- Diverse (la fel ca înainte) -----
+
+    def _probe_duration(self, video_path: Path) -> float:
+        try:
+            meta = ffmpeg.probe(str(video_path))
+            for stream in meta.get("streams", []):
+                if stream.get("codec_type") == "video" and stream.get("duration"):
+                    return float(stream["duration"])
+            if "format" in meta and meta["format"].get("duration"):
+                return float(meta["format"]["duration"])
+        except Exception as e:
+            logging.warning("Nu pot obține durata video: %s", e)
+        return 0.0
+
+    def _estimate_timeline(self, duration: float, attach_mode: str):
+        rt_factor = float(os.getenv("SUBTITLE_RT_FACTOR", "1.2"))
+        translate_factor = float(os.getenv("SUBTITLE_TRANSLATE_FACTOR", "0.25"))
+        burn_factor = float(os.getenv("SUBTITLE_BURN_FACTOR", "0.5"))
+        summary_factor = float(os.getenv("SUBTITLE_SUMMARY_FACTOR", "0.15"))
+
+        duration = max(duration, 60.0)
+
+        est_transcribe = duration * rt_factor
+        est_translate = duration * translate_factor
+        est_burn = duration * burn_factor if attach_mode == "hard" else 0.0
+        est_summary = duration * summary_factor
+        est_overhead = 8.0
+
+        total = est_transcribe + est_translate + est_burn + est_summary + est_overhead
+        return {
+            "transcribe": est_transcribe,
+            "translate": est_translate,
+            "burn": est_burn,
+            "summary": est_summary,
+            "overhead": est_overhead,
+            "total": total,
+        }
+
+    def _run_stage(
+        self,
+        label: str,
+        expected_seconds: float,
+        base_percent: float,
+        weight_percent: float,
+        func,
+    ):
+        start = time.time()
+        done = threading.Event()
+
+        def ticker():
+            while not done.is_set():
+                elapsed = time.time() - start
+                ratio = min(1.0, elapsed / max(expected_seconds, 0.1))
+                percent = base_percent + ratio * weight_percent
+                eta = max(
+                    0.0,
+                    (self._total_expected or expected_seconds)
+                    - (time.time() - self._global_start),
+                )
+                send_task_progress(
+                    percent=percent, eta_seconds=eta, stage=label, detail="în curs"
+                )
+                time.sleep(1.0)
+
+        t = threading.Thread(target=ticker, daemon=True)
+        t.start()
+        try:
+            result = func()
+        finally:
+            done.set()
+            t.join(timeout=0.2)
+
+        percent = base_percent + weight_percent
+        eta = max(
+            0.0,
+            (self._total_expected or expected_seconds)
+            - (time.time() - self._global_start),
+        )
+        send_task_progress(
+            percent=percent, eta_seconds=eta, stage=label, detail="finalizat"
+        )
+        return result
+
+    # ------------ API publică ------------
+
+    def generate(
+        self,
+        filepath: str,
+        lang: str = "ro",
+        attach_mode: str = "soft",
+        detail_level: str = "medium",
+        translator_mode: str = "cloud",
+    ):
+        """
+        Generează subtitrare în limba `lang` pentru videoclipul dat.
+        """
+        video_path = Path(filepath)
+        attach_mode = (attach_mode or "soft").lower()
+        translator_mode = (translator_mode or "cloud").lower()
+        print(
+            f"[SUBTITLE] attach_mode={attach_mode}, detail_level={detail_level}, translator_mode={translator_mode}"
+        )
+        self._global_start = time.time()
+
+        duration = self._probe_duration(video_path)
+        timeline = self._estimate_timeline(duration, attach_mode)
+        self._total_expected = timeline["total"]
+
+        pct_transcribe = 55.0
+        pct_translate = 25.0 if attach_mode != "hard" else 20.0
+        pct_summary = 10.0
+        pct_burn = 0.0 if attach_mode != "hard" else 8.0
+        pct_finalize = 100.0 - (pct_transcribe + pct_translate + pct_burn)
+
+        send_task_progress(
+            percent=1.0,
+            eta_seconds=timeline["total"],
+            stage="init",
+            detail="pregătire",
+        )
+
+        # 1) Transcriere
+        print(f"[SUBTITLE] Transcriere start: {video_path.name}")
+        segments, detected_lang = self._run_stage(
+            "transcriere",
+            expected_seconds=timeline["transcribe"],
+            base_percent=0.0,
+            weight_percent=pct_transcribe,
+            func=lambda: self._transcribe(str(video_path)),
+        )
+        print(
+            f"[SUBTITLE] Transcriere completă ({len(segments)} segmente), limbă detectată: {detected_lang}"
+        )
+
+        # 2) Traducere
+        print("[SUBTITLE] Traducere segmente...")
+        translated_texts, originals = self._run_stage(
+            "traducere",
+            expected_seconds=timeline["translate"],
+            base_percent=pct_transcribe,
+            weight_percent=pct_translate,
+            func=lambda: self._translate_segments(
+                segments, target_lang=lang, mode=translator_mode
+            ),
+        )
+        print(f"[SUBTITLE] Traducere completă ({len(translated_texts)} segmente)")
+
+        # 3) Optimizare segmente (CPS + durată + gap)
+        segments, translated_texts = SubtitleQualityOptimizer.optimize_segments(
+            segments, translated_texts
+        )
+
+        # 4) SRT
+        srt_path = self.processed_dir / f"{video_path.stem}_{lang}.srt"
+        self._write_srt(segments, translated_texts, srt_path)
+        send_task_progress(
+            percent=pct_transcribe + pct_translate,
+            eta_seconds=max(0.0, timeline["total"] - (time.time() - self._global_start)),
+            stage="srt",
+            detail="fișier SRT generat",
+        )
+
+        # 5) Rezumat video (folosește textul tradus concatenat)
+        full_text = "\n".join(translated_texts)
+        print("[SUBTITLE] Rezumat video...")
+        summary_result = self._run_stage(
+            "rezumat",
+            expected_seconds=timeline.get("summary", max(8.0, duration * 0.1)),
+            base_percent=pct_transcribe + pct_translate,
+            weight_percent=pct_summary,
+            func=lambda: self._summary_service.summarize_content(
+                content_id=video_path.stem,
+                text=full_text,
+                metadata={
+                    "source_type": "video",
+                    "lang": lang,
+                    "detail": detail_level,
+                },
+            ),
+        )
+
+        response = {
+            "attach_mode": attach_mode,
+            "subtitle_file": f"/download/{srt_path.name}",
+            "subtitle_language": lang,
+            "detected_language": detected_lang,
+            "segments": len(segments),
+            "note": "Subtitrare generată cu Whisper/stable-ts + traducere automată",
+            "summary": summary_result.get("summary"),
+            "summary_file": f"/download/{summary_result.get('summary_file')}"
+            if summary_result.get("summary_file")
+            else None,
+        }
+
+        # 6) Hard attach (burn)
+        if attach_mode == "hard":
+            output_video = (
+                self.processed_dir / f"{video_path.stem}_{lang}_subtitled.mp4"
+            )
+            self._run_stage(
+                "burn",
+                expected_seconds=timeline["burn"],
+                base_percent=pct_transcribe + pct_translate + pct_summary,
+                weight_percent=pct_burn,
+                func=lambda: self._burn_subtitles(video_path, srt_path, output_video),
+            )
+            response["video_file"] = f"/download/{output_video.name}"
         else:
-            pattern, replacement, flags = pattern_data
-        
-        cleaned = re.sub(pattern, replacement, cleaned, flags=flags)
-        cleaned = cleaned.strip()
-    
-    # Elimină ghilimele la început/final
-    if cleaned.startswith('"') and cleaned.endswith('"'):
-        cleaned = cleaned[1:-1].strip()
-    if cleaned.startswith("'") and cleaned.endswith("'"):
-        cleaned = cleaned[1:-1].strip()
-    
-    # Curăță spații multiple
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-    cleaned = re.sub(r'\s*\n\s*', '\n', cleaned)
-    
-    # Elimină paranteze lungi la final
-    cleaned = re.sub(r'\s*\([^)]{10,}\)\s*$', '', cleaned)
-    
-    # Taie tot după două newline-uri consecutive
-    if '\n\n' in cleaned:
-        cleaned = cleaned.split('\n\n')[0].strip()
-    
-    return cleaned
+            response["video_file"] = f"/download/{srt_path.name}"
 
-def get_language_group(language: str) -> int:
-    """Returnează grupul limbii sau -1 dacă nu e suportată"""
-    return LANGUAGE_GROUPS.get(language, -1)
-
-def determine_translation_strategy(source_lang: str, target_lang: str) -> tuple[TranslationStrategy, str]:
-    """
-    Determină strategia optimă de traducere bazată pe grupurile limbilor
-    
-    Returns:
-        (strategy, reason) - strategia și explicația
-    """
-    source_group = get_language_group(source_lang)
-    target_group = get_language_group(target_lang)
-    
-    # Limbi nesuportate
-    if source_group == -1 or target_group == -1:
-        unsupported = []
-        if source_group == -1:
-            unsupported.append(source_lang)
-        if target_group == -1:
-            unsupported.append(target_lang)
-        return TranslationStrategy.DIRECT, f"⚠️ Limbă nesuportată: {', '.join(unsupported)}"
-    
-    # Engleza e implicată → traducere directă
-    if source_group == 0 or target_group == 0:
-        return TranslationStrategy.DIRECT, "✅ Traducere directă (include Engleză)"
-    
-    # Același grup → traducere directă
-    if source_group == target_group:
-        return TranslationStrategy.DIRECT, f"✅ Traducere directă (același grup {source_group})"
-    
-    # Grupuri diferite → PIVOT prin engleză
-    return TranslationStrategy.PIVOT, f"🔄 Pivot prin Engleză (grup {source_group} → grup {target_group})"
-
-def _core_translate(text: str, source_lang: str, target_lang: str, max_length: int, num_beams: int) -> str:
-    """Funcție internă de traducere (o singură direcție)"""
-    
-    # Prompt strict
-    prompt = f"""Translate this from {source_lang} to {target_lang}. Output ONLY the translation, no explanations, no notes, no extra text:
-
-{text}
-
-Translation:"""
-    
-    messages = [{"role": "user", "content": prompt}]
-    
-    try:
-        text_input = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
+        send_task_progress(
+            percent=100.0, eta_seconds=0.0, stage="gata", detail="complet"
         )
-    except Exception:
-        text_input = prompt
-    
-    inputs = tokenizer(
-        [text_input],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=4096
-    ).to("cuda")
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            max_new_tokens=max_length,
-            num_beams=num_beams,
-            do_sample=False,
-            temperature=None,
-            repetition_penalty=1.15,
-            length_penalty=1.0,
-            early_stopping=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            no_repeat_ngram_size=3
+        print(
+            f"[SUBTITLE] Finalizat. SRT: {srt_path.name}, Video out: {response.get('video_file')}"
         )
-
-    # Elimină promptul
-    generated_ids = [
-        output_ids[len(input_ids):] 
-        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    
-    response_text = tokenizer.batch_decode(
-        generated_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True
-    )[0]
-    
-    return clean_translation_output(response_text)
-
-class TranslationRequest(BaseModel):
-    text: str
-    source_lang: str = "English"
-    target_lang: str = "Romanian"
-    max_length: int = 2048
-    use_beam_search: bool = True
-    num_beams: int = 3
-    strategy: TranslationStrategy = TranslationStrategy.AUTO
-    
-    @validator('text')
-    def validate_text(cls, v):
-        if not v or len(v.strip()) == 0:
-            raise ValueError("Textul nu poate fi gol")
-        if len(v) > 15000:
-            raise ValueError("Text prea lung (max 15000 caractere)")
-        return v.strip()
-    
-    @validator('max_length')
-    def validate_max_length(cls, v):
-        if v < 128 or v > 4096:
-            raise ValueError("max_length trebuie să fie între 128 și 4096")
-        return v
-    
-    @validator('num_beams')
-    def validate_num_beams(cls, v):
-        if v < 1 or v > 5:
-            raise ValueError("num_beams trebuie să fie între 1 și 5")
-        return v
-
-class BatchTranslationRequest(BaseModel):
-    texts: list[str]
-    source_lang: str = "English"
-    target_lang: str = "Romanian"
-    max_length: int = 2048
-    strategy: TranslationStrategy = TranslationStrategy.AUTO
-    
-    @validator('texts')
-    def validate_texts(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("Lista de texte nu poate fi goală")
-        if len(v) > 50:
-            raise ValueError("Maximum 50 texte per batch")
-        for text in v:
-            if len(text) > 15000:
-                raise ValueError("Unul dintre texte depășește 15000 caractere")
-        return v
-
-@app.on_event("startup")
-async def load_model():
-    global model, tokenizer
-    logger.info(f"🚀 Se inițializează: {MODEL_ID}...")
-    logger.info("ℹ️ Arhitectura: Decoder-Only (LLaMA Based)")
-    
-    try:
-        bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False
-        )
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            trust_remote_code=True,
-            use_fast=True
-        )
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
-        
-        model.eval()
-        
-        logger.info(f"✅ Model Încărcat! VRAM optimizată cu 8-bit quantization.")
-        logger.info(f"📊 Device map: {model.hf_device_map}")
-        
-    except Exception as e:
-        logger.error(f"❌ Eroare la încărcare: {e}", exc_info=True)
-        raise e
-
-@app.get("/health")
-async def health_check():
-    """Verifică starea serverului"""
-    cuda_available = torch.cuda.is_available()
-    vram_allocated = torch.cuda.memory_allocated(0) / 1024**3 if cuda_available else 0
-    vram_reserved = torch.cuda.memory_reserved(0) / 1024**3 if cuda_available else 0
-    
-    return {
-        "status": "healthy" if model is not None else "loading",
-        "model": MODEL_ID,
-        "model_loaded": model is not None,
-        "device": "cuda" if cuda_available else "cpu",
-        "vram_allocated_gb": round(vram_allocated, 2),
-        "vram_reserved_gb": round(vram_reserved, 2),
-        "supported_languages": list(LANGUAGE_GROUPS.keys()),
-        "total_languages": len(LANGUAGE_GROUPS)
-    }
-
-@app.get("/languages")
-async def list_languages():
-    """Listează limbile suportate și grupurile lor"""
-    groups = {}
-    for lang, group in LANGUAGE_GROUPS.items():
-        if group not in groups:
-            groups[group] = []
-        groups[group].append(lang)
-    
-    return {
-        "languages": LANGUAGE_GROUPS,
-        "groups": groups,
-        "note": "Group 0 (English) este pivot universal. Traducerile între grupuri diferite folosesc pivot automat."
-    }
-
-@app.post("/translate")
-async def translate_text(request: TranslationRequest):
-    """Traduce text cu detecție automată de strategie"""
-    if not model or not tokenizer:
-        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
-
-    # Determină strategia
-    if request.strategy == TranslationStrategy.AUTO:
-        strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
-    else:
-        strategy = request.strategy
-        reason = f"Strategie forțată: {strategy.value}"
-    
-    logger.info(f"📝 Traducere: {request.source_lang} -> {request.target_lang}")
-    logger.info(f"🎯 Strategie: {strategy.value} - {reason}")
-    logger.info(f"📏 Lungime: {len(request.text)} caractere")
-
-    try:
-        if strategy == TranslationStrategy.DIRECT:
-            # Traducere directă
-            translation = _core_translate(
-                request.text,
-                request.source_lang,
-                request.target_lang,
-                request.max_length,
-                request.num_beams if request.use_beam_search else 1
-            )
-            steps = 1
-            
-        else:  # PIVOT
-            # Pas 1: Source -> English
-            logger.info(f"🔄 Pas 1/2: {request.source_lang} -> English")
-            english_text = _core_translate(
-                request.text,
-                request.source_lang,
-                "English",
-                request.max_length,
-                request.num_beams if request.use_beam_search else 1
-            )
-            
-            # Pas 2: English -> Target
-            logger.info(f"🔄 Pas 2/2: English -> {request.target_lang}")
-            translation = _core_translate(
-                english_text,
-                "English",
-                request.target_lang,
-                request.max_length,
-                request.num_beams if request.use_beam_search else 1
-            )
-            steps = 2
-        
-        logger.info(f"✅ Traducere completă: {len(translation)} caractere")
-        
-        return {
-            "source": request.source_lang,
-            "target": request.target_lang,
-            "model": "X-ALMA-13B-Group2",
-            "strategy": strategy.value,
-            "strategy_reason": reason,
-            "translation": translation,
-            "stats": {
-                "chars_in": len(request.text),
-                "chars_out": len(translation),
-                "translation_steps": steps,
-                "intermediate_translation": english_text if strategy == TranslationStrategy.PIVOT else None
-            }
-        }
-
-    except torch.cuda.OutOfMemoryError:
-        logger.error("❌ VRAM insuficient!")
-        torch.cuda.empty_cache()
-        raise HTTPException(status_code=507, detail="VRAM insuficient.")
-    except Exception as e:
-        logger.error(f"❌ Eroare: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-@app.post("/translate/batch")
-async def translate_batch(request: BatchTranslationRequest):
-    """Traduce multiple texte cu strategie automată"""
-    if not model or not tokenizer:
-        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
-
-    # Determină strategia
-    if request.strategy == TranslationStrategy.AUTO:
-        strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
-    else:
-        strategy = request.strategy
-        reason = f"Strategie forțată: {strategy.value}"
-    
-    logger.info(f"📦 Batch: {len(request.texts)} texte")
-    logger.info(f"🎯 Strategie: {strategy.value} - {reason}")
-
-    try:
-        translations = []
-        
-        for i, text in enumerate(request.texts):
-            logger.info(f"📝 Traducere {i+1}/{len(request.texts)}")
-            
-            if strategy == TranslationStrategy.DIRECT:
-                translation = _core_translate(
-                    text,
-                    request.source_lang,
-                    request.target_lang,
-                    request.max_length,
-                    2  # Beam search redus pentru batch
-                )
-            else:  # PIVOT
-                english_text = _core_translate(
-                    text,
-                    request.source_lang,
-                    "English",
-                    request.max_length,
-                    2
-                )
-                translation = _core_translate(
-                    english_text,
-                    "English",
-                    request.target_lang,
-                    request.max_length,
-                    2
-                )
-            
-            translations.append(translation)
-        
-        logger.info(f"✅ Batch completat: {len(translations)} traduceri")
-        
-        return {
-            "source": request.source_lang,
-            "target": request.target_lang,
-            "model": "X-ALMA-13B-Group2",
-            "strategy": strategy.value,
-            "strategy_reason": reason,
-            "translations": translations,
-            "count": len(translations)
-        }
-
-    except torch.cuda.OutOfMemoryError:
-        logger.error("❌ VRAM insuficient!")
-        torch.cuda.empty_cache()
-        raise HTTPException(status_code=507, detail="VRAM insuficient.")
-    except Exception as e:
-        logger.error(f"❌ Eroare: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Eroare: {str(e)}")
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-@app.post("/translate/debug")
-async def translate_debug(request: TranslationRequest):
-    """Debug endpoint cu informații detaliate"""
-    if not model or not tokenizer:
-        raise HTTPException(status_code=503, detail="Modelul se încarcă...")
-
-    strategy, reason = determine_translation_strategy(request.source_lang, request.target_lang)
-    
-    source_group = get_language_group(request.source_lang)
-    target_group = get_language_group(request.target_lang)
-    
-    return {
-        "source_language": request.source_lang,
-        "target_language": request.target_lang,
-        "source_group": source_group,
-        "target_group": target_group,
-        "recommended_strategy": strategy.value,
-        "strategy_reason": reason,
-        "will_use_pivot": strategy == TranslationStrategy.PIVOT,
-        "supported_languages": list(LANGUAGE_GROUPS.keys()),
-        "input_text": request.text,
-        "input_length": len(request.text)
-    }
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "alma_server:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-        workers=1,
-        log_level="info"
-    )
+        return response
