@@ -12,7 +12,71 @@ import requests
 import ffmpeg
 import pysubs2
 import whisper
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslatordef _transcribe(self, filepath: str):
+        """
+        Transcriere folosind WhisperX:
+        1. Transcriere rapidă (batch inference).
+        2. Aliniere forțată (Wav2Vec2) pentru timp exact.
+        """
+        device = "cuda"
+        # Pe RTX 5090 folosim float16 pentru precizie maximă. 
+        # int8 e doar pentru economie de VRAM, de care tu nu ai nevoie.
+        compute_type = "float16" 
+        batch_size = 16 # Merge și 32 pe 5090, dar 16 e super safe și rapid
+
+        logging.info(f"[WhisperX] Loading model {self.whisper_model_name} on {device}...")
+
+        # 1. Încărcare Model Transcriere
+        model = whisperx.load_model(
+            self.whisper_model_name, 
+            device, 
+            compute_type=compute_type,
+            language="ro" # Specificăm româna pentru a ajuta modelul
+        )
+
+        # 2. Transcriere propriu-zisă
+        logging.info("[WhisperX] Transcribing audio...")
+        audio = whisperx.load_audio(filepath)
+        result = model.transcribe(audio, batch_size=batch_size)
+        
+        # Salvăm limba detectată (sau impusă)
+        language = result["language"]
+
+        # (Opțional) Curățăm VRAM-ul de modelul de transcriere pentru a face loc celui de aliniere
+        # Pe 5090 nu e strict necesar, dar e "best practice"
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 3. Încărcare Model Aliniere
+        logging.info("[WhisperX] Loading alignment model...")
+        model_a, metadata = whisperx.load_align_model(
+            language_code=language, 
+            device=device
+        )
+
+        # 4. Aliniere (Aici se întâmplă magia sincronizării)
+        logging.info("[WhisperX] Aligning segments...")
+        aligned_result = whisperx.align(
+            result["segments"], 
+            model_a, 
+            metadata, 
+            audio, 
+            device, 
+            return_char_alignments=False
+        )
+
+        # Curățăm și modelul de aliniere
+        del model_a
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 5. Formatare pentru restul codului
+        # WhisperX returnează o structură complexă, noi extragem lista de segmente
+        segments = aligned_result["segments"]
+        
+        logging.info(f"[WhisperX] Done. {len(segments)} aligned segments.")
+        return segments, language
 
 from services.progress_bar import send_task_progress
 from services.category_v.summary_service import SummaryService
